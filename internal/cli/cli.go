@@ -56,7 +56,8 @@ login password sources (first non-empty wins):
   $MMCLI_PASSWORD, then a line read from stdin.
   post @user sends a direct message; --team does not apply there. --file
   attaches up to 10 local files (checked before any upload); the message may
-  then be empty.
+  then be empty. Flags go before "--". If an upload fails midway, files
+  already uploaded stay unattached on the server and no post is created.
   stream prints one JSON line per live event until interrupted. A post seen
   by several contexts of the same server is merged into one line after
   --merge-window: "contexts" lists who can see (and reply to) it, "mentions"

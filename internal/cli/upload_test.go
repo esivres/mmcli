@@ -48,8 +48,17 @@ func newUploadServer(t *testing.T) (*uploadServer, *httptest.Server) {
 				case "channel_id":
 					channel = string(b)
 				case "files":
+					// Mattermost streams uploads and needs the channel first.
+					if channel == "" {
+						http.Error(w, `{"message":"Expected a channel_id to precede the files"}`, http.StatusBadRequest)
+						return
+					}
 					name, content = params["filename"], string(b)
 				}
+			}
+			if strings.HasPrefix(name, "fail") {
+				http.Error(w, `{"id":"api.file.too_large","message":"File is too large","status_code":413}`, http.StatusRequestEntityTooLarge)
+				return
 			}
 			us.mu.Lock()
 			us.uploads = append(us.uploads, channel+"|"+name+"|"+content)
@@ -57,6 +66,8 @@ func newUploadServer(t *testing.T) (*uploadServer, *httptest.Server) {
 			us.mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"file_infos":[{"id":"` + id + `","name":"x"}]}`))
+		case "/api/v4/posts/" + postID:
+			_, _ = w.Write([]byte(`{"id":"` + postID + `","user_id":"alice1","channel_id":"ops1","root_id":""}`))
 		case "/api/v4/posts":
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -122,5 +133,33 @@ func TestPostFilesCheckedFirst(t *testing.T) {
 	}
 	if len(us.uploads) != 0 || us.postBody != nil {
 		t.Fatalf("server touched: uploads %v, post %v", us.uploads, us.postBody)
+	}
+}
+
+// A reply carries its files into the thread's channel.
+func TestReplyWithFile(t *testing.T) {
+	us, srv := newUploadServer(t)
+	d, _, errOut := loggedIn(t, srv.URL)
+	if code := run(d, []string{"reply", postID, "лог", "--file", tempFile(t, "build.log", "FAIL")}); code != 0 {
+		t.Fatalf("reply exit %d: %s", code, errOut)
+	}
+	if got := strings.Join(us.uploads, ";"); got != "ops1|build.log|FAIL" {
+		t.Fatalf("uploads %q", got)
+	}
+	if us.postBody["root_id"] != postID || us.postBody["message"] != "лог" {
+		t.Fatalf("post body %v", us.postBody)
+	}
+}
+
+// A failed upload midway must not produce a post missing some of its files.
+func TestPostNotCreatedAfterFailedUpload(t *testing.T) {
+	us, srv := newUploadServer(t)
+	d, _, errOut := loggedIn(t, srv.URL)
+	args := []string{"post", "@alice", "три файла", "--file", tempFile(t, "a.txt", "a"), "--file", tempFile(t, "fail.bin", "x"), "--file", tempFile(t, "c.txt", "c")}
+	if code := run(d, args); code != 1 || !strings.Contains(errOut.String(), "too large") {
+		t.Fatalf("want exit 1 with the server's reason, got %d: %s", code, errOut)
+	}
+	if us.postBody != nil {
+		t.Fatalf("post created despite a failed upload: %v", us.postBody)
 	}
 }

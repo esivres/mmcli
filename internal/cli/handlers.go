@@ -460,7 +460,7 @@ func cmdReply(d deps, args []string) error {
 		return err
 	}
 	if fs.NArg() < 1 || (fs.NArg() < 2 && len(files) == 0) {
-		return fmt.Errorf("usage: mmcli reply <link|post_id> <message...> [--file PATH]...")
+		return fmt.Errorf("usage: mmcli reply <link|post_id> [message...] [--file PATH]...")
 	}
 	if err := checkAttachments(files); err != nil {
 		return err
@@ -549,7 +549,7 @@ func cmdPost(d deps, args []string) error {
 		return err
 	}
 	if fs.NArg() < 1 || (fs.NArg() < 2 && len(files) == 0) {
-		return fmt.Errorf("usage: mmcli post <channel|~channel|@user|link> <message...> [--file PATH]...")
+		return fmt.Errorf("usage: mmcli post <channel|~channel|@user|link> [message...] [--file PATH]...")
 	}
 	if err := checkAttachments(files); err != nil {
 		return err
