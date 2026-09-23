@@ -32,9 +32,8 @@ type Names struct {
 }
 
 // Posts flattens a PostList into chronological RenderedPosts (oldest first),
-// resolving IDs via names. Mattermost's PostList.Order
-// is not reliably time-sorted (notably the thread endpoint), so we sort by
-// CreateAt explicitly.
+// resolving IDs via names. Mattermost's PostList.Order is not reliably
+// time-sorted (notably the thread endpoint), so we sort by CreateAt explicitly.
 func Posts(pl *mm.PostList, names Names) []RenderedPost {
 	if pl == nil {
 		return nil

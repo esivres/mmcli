@@ -214,22 +214,25 @@ func resolveTeamID(ctx context.Context, client *mm.Client, cc config.Context, ex
 }
 
 // namesFor resolves authors and channels of posts. It is best-effort: on
-// errors the renderer falls back to raw IDs.
+// errors the renderer falls back to raw IDs and omits the channel label.
 func namesFor(ctx context.Context, client *mm.Client, posts ...*mm.Post) output.Names {
 	names := output.Names{Users: map[string]string{}, Channels: map[string]string{}}
 	userIDs := map[string]struct{}{}
-	channels := map[string]*mm.Channel{}
+	channels := map[string]*mm.Channel{} // nil marks an inaccessible channel
+	hasDirect := false
 	for _, p := range posts {
 		userIDs[p.UserID] = struct{}{}
-		if _, ok := channels[p.ChannelID]; ok {
+		if _, seen := channels[p.ChannelID]; seen {
 			continue
 		}
 		ch, err := client.GetChannel(ctx, p.ChannelID)
 		if err != nil {
+			channels[p.ChannelID] = nil
 			continue
 		}
 		channels[p.ChannelID] = ch
 		if ch.Type == "D" {
+			hasDirect = true
 			// Direct channel names are "<userID>__<userID>".
 			for _, id := range strings.Split(ch.Name, "__") {
 				userIDs[id] = struct{}{}
@@ -248,38 +251,51 @@ func namesFor(ctx context.Context, client *mm.Client, posts ...*mm.Post) output.
 	}
 
 	var meID string
+	if hasDirect {
+		if me, err := client.Me(ctx); err == nil {
+			meID = me.ID
+		}
+	}
 	for id, ch := range channels {
-		switch ch.Type {
-		case "D":
-			if meID == "" {
-				if me, err := client.Me(ctx); err == nil {
-					meID = me.ID
-				}
-			}
-			names.Channels[id] = directLabel(ch.Name, meID, names.Users)
-		case "G":
-			names.Channels[id] = ch.DisplayName
+		var label string
+		switch {
+		case ch == nil:
+		case ch.Type == "D":
+			label = directLabel(ch.Name, meID, names.Users)
+		case ch.Type == "G":
+			label = ch.DisplayName
 		default:
-			names.Channels[id] = ch.Name
+			label = ch.Name
+		}
+		if label != "" {
+			names.Channels[id] = label
 		}
 	}
 	return names
 }
 
-// directLabel renders a direct channel as "@<the other user>".
+// directLabel renders a direct channel as "@<the other user>", or "" when the
+// other side cannot be told apart from the caller.
 func directLabel(channelName, meID string, users map[string]string) string {
 	a, b, ok := strings.Cut(channelName, "__")
 	if !ok {
-		return channelName
+		return ""
 	}
-	other := a
-	if a == meID {
+	var other string
+	switch {
+	case a == b:
+		other = a
+	case meID == a:
 		other = b
+	case meID == b:
+		other = a
+	default:
+		return ""
 	}
 	if u := users[other]; u != "" {
 		return "@" + u
 	}
-	return channelName
+	return ""
 }
 
 // postsOf returns the posts of a PostList in no particular order.
