@@ -60,8 +60,9 @@ login password sources (first non-empty wins):
   emitted within 24h. Lines
   keep arrival order. Status lines:
   {"event":"connected"|"disconnected"|"gap","context","detail"}; a gap means
-  events were lost (no resume, or skipped sequence numbers). A rejected token
-  or login is final: before the first connection stream exits with an error;
+  events were lost (no resume, or skipped sequence numbers); on a slow
+  network a gap may follow connected. A token or login rejected by
+  Mattermost is final: on the first attempt stream exits with an error;
   later it prints {"event":"failed",...} and exits non-zero once no context
   is left.
   login makes the context current only if none is current yet, or with --use.

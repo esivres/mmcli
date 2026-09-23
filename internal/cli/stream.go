@@ -349,24 +349,28 @@ func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int
 		return err
 	}
 
-	// Pongs are handled only while reading, so reading never waits for REST
-	// lookups or a busy consumer; the buffer absorbs bursts.
+	// Pongs are handled only while reading; the buffer lets reading outlast
+	// REST lookups. The reader closes events after an error, so everything
+	// already read is processed before the session ends.
 	events := make(chan *mm.WSEvent, 4096)
-	failed := make(chan error, 2)
+	var readErr error
+	pingErr := make(chan error, 1)
 	var workers sync.WaitGroup
 	defer func() { cancel(); conn.CloseNow(); workers.Wait() }()
 	workers.Add(2)
 	go func() {
 		defer workers.Done()
+		defer close(events)
 		for {
 			ev, err := conn.Next(ctx)
 			if err != nil {
-				failed <- err
+				readErr = err
 				return
 			}
 			select {
 			case events <- ev:
 			case <-ctx.Done():
+				readErr = ctx.Err()
 				return
 			}
 		}
@@ -384,7 +388,8 @@ func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int
 				err := conn.Ping(pctx)
 				pcancel()
 				if err != nil && ctx.Err() == nil {
-					failed <- fmt.Errorf("no pong from server: %w", err)
+					pingErr <- fmt.Errorf("no pong from server: %w", err)
+					conn.CloseNow() // ends the reader, which drains into events
 					return
 				}
 			}
@@ -407,12 +412,19 @@ func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int
 	for {
 		var ev *mm.WSEvent
 		select {
-		case err := <-failed:
-			return err
 		case <-grace:
 			markConnected()
 			continue
-		case ev = <-events:
+		case e, ok := <-events:
+			if !ok {
+				select {
+				case err := <-pingErr:
+					return err
+				default:
+					return readErr
+				}
+			}
+			ev = e
 		}
 		if ev.Event == "hello" {
 			var id string
@@ -461,23 +473,23 @@ func (s *streamSource) sighting(ctx context.Context, ev *mm.WSEvent) (sighting, 
 	_ = json.Unmarshal([]byte(mentionsRaw), &mentions)
 	mentioned := slices.Contains(mentions, s.meID)
 
-	ch := s.channel(ctx, p.ChannelID)
-	names := s.names(ctx, &p, ch)
-	rendered := output.One(&p, names)
 	// posted carries fresh channel data (renames included); edits and deletes
-	// rely on the cache.
+	// rely on the cache, so refresh it before labeling.
 	var channelType, channelName string
 	_ = json.Unmarshal(ev.Data["channel_type"], &channelType)
 	_ = json.Unmarshal(ev.Data["channel_name"], &channelName)
-	if ch != nil {
-		if channelType == "" {
-			channelType, channelName = ch.Type, ch.Name
-		} else if ch.Name != channelName {
-			fresh := *ch
-			fresh.Name = channelName
-			s.channels[p.ChannelID] = cachedChannel{ch: &fresh, at: time.Now()}
-		}
+	ch := s.channel(ctx, p.ChannelID)
+	if ch != nil && channelType != "" && (ch.Type != channelType || ch.Name != channelName) {
+		fresh := *ch
+		fresh.Type, fresh.Name = channelType, channelName
+		s.channels[p.ChannelID] = cachedChannel{ch: &fresh, at: time.Now()}
+		ch = &fresh
 	}
+	if ch != nil && channelType == "" {
+		channelType, channelName = ch.Type, ch.Name
+	}
+	names := s.names(ctx, &p, ch)
+	rendered := output.One(&p, names)
 	return sighting{
 		context:   s.name,
 		key:       fmt.Sprintf("%s|%s|%s|%d", s.server, ev.Event, p.ID, p.UpdateAt),

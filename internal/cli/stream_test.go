@@ -129,6 +129,14 @@ func editedEvent(seq int64, id, channel string) map[string]any {
 	return map[string]any{"event": "post_edited", "seq": seq, "data": map[string]any{"post": string(post)}}
 }
 
+// renamedPost is a posted event whose channel was renamed after the REST
+// lookup would have cached it.
+func renamedPost(seq int64, id, channel, newName string) map[string]any {
+	ev := postedEvent(seq, id, channel)
+	ev["data"].(map[string]any)["channel_name"] = newName
+	return ev
+}
+
 // postedEvent builds a "posted" websocket event as the server sends it.
 func postedEvent(seq int64, id, channel string, mentions ...string) map[string]any {
 	post, _ := json.Marshal(map[string]any{"id": id, "user_id": "alice1", "channel_id": channel, "message": "hi " + id, "create_at": 1, "update_at": 1})
@@ -522,5 +530,43 @@ func TestStreamResumeWithoutEventsConnects(t *testing.T) {
 	})
 	if got, want := sequence(lines), "connected posted:p1 disconnected connected"; got != want {
 		t.Fatalf("lines\n got %s\nwant %s", got, want)
+	}
+}
+
+// Posts read before the server closes the socket must all come out before
+// the disconnect; dropping them would also fake a gap.
+func TestStreamDrainsBeforeDisconnect(t *testing.T) {
+	ws, srv := newWSServer(t)
+	var evs []map[string]any
+	var want []string
+	for i := 1; i <= 20; i++ {
+		id := fmt.Sprintf("p%02d", i)
+		evs = append(evs, postedEvent(int64(i), id, "c1"))
+		want = append(want, "posted:"+id)
+	}
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", events: evs}}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
+		return len(events(l, "disconnected")) > 0
+	})
+	got := sequence(lines)
+	if !strings.HasPrefix(got, "connected "+strings.Join(want, " ")+" disconnected") {
+		t.Fatalf("posts lost or reordered around the disconnect: %s", got)
+	}
+}
+
+// A renamed channel is matched and labeled by its new name, and later edits
+// in it pass the channel filter from the refreshed cache.
+func TestStreamFollowsChannelRename(t *testing.T) {
+	ws, srv := newWSServer(t)
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", hold: true, events: []map[string]any{
+		renamedPost(1, "p1", "c1", "renamed"), editedEvent(2, "p9", "c1")}}}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot", "--channel", "renamed"}, func(l []map[string]any) bool {
+		return len(events(l, "post_edited")) == 1
+	})
+	if got, want := sequence(lines), "connected posted:p1 post_edited:p9"; got != want {
+		t.Fatalf("lines\n got %s\nwant %s", got, want)
+	}
+	if ch := posts(lines)["p1"]["channel"]; ch != "renamed" {
+		t.Fatalf("renamed channel labeled %v", ch)
 	}
 }
