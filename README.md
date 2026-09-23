@@ -2,7 +2,7 @@
 
 Простой консольный клиент Mattermost. Stateless: каждый запуск — отдельный
 процесс, который ходит к серверу по REST. Секреты (пароль, кешированный
-session-токен) хранятся в системном keyring через Secret Service (D-Bus).
+session-токен) хранятся в системном keyring (Secret Service на Linux, Keychain на macOS).
 
 ## Установка
 

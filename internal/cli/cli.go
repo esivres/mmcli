@@ -26,6 +26,7 @@ Usage:
   mmcli reply   <link|post_id> <message...> [common]
   mmcli post    <channel|link> <message...> [--team T] [common]
   mmcli delete  <link|post_id> [common]
+  mmcli version
 
 Common flags (get/thread/search/reply/post):
   --context NAME   use a specific stored context (default: current)
@@ -58,6 +59,9 @@ Examples:
   mmcli search deploy --channel ops --from alice --before 2026-06-15
   mmcli reply <link|id> "looking into it"
   mmcli post ops "deploy finished"`
+
+// Version is set at release time via -ldflags.
+var Version = "dev"
 
 // deps bundles injectable dependencies (real or test fakes).
 type deps struct {
@@ -98,6 +102,9 @@ func run(d deps, args []string) int {
 		err = cmdPost(d, args[1:])
 	case "delete":
 		err = cmdDelete(d, args[1:])
+	case "version", "--version":
+		fmt.Fprintln(d.stdout, Version)
+		return 0
 	case "help", "-h", "--help":
 		fmt.Fprintln(d.stdout, usage)
 		return 0

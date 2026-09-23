@@ -1,6 +1,6 @@
 // Package secrets abstracts credential storage. The system implementation uses
-// the freedesktop Secret Service (org.freedesktop.secrets) over D-Bus via
-// zalando/go-keyring; an in-memory implementation is provided for tests.
+// the OS keyring via zalando/go-keyring (Secret Service over D-Bus on Linux,
+// Keychain on macOS); an in-memory implementation is provided for tests.
 package secrets
 
 import (
@@ -22,7 +22,7 @@ type Store interface {
 	Delete(key string) error
 }
 
-// SystemStore talks to the OS keyring (Secret Service on Linux).
+// SystemStore talks to the OS keyring (Secret Service on Linux, Keychain on macOS).
 type SystemStore struct{}
 
 // Get returns the value for key, or ErrNotFound.
