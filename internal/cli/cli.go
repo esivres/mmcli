@@ -25,7 +25,7 @@ Usage:
   mmcli thread  <link|post_id> [common]
   mmcli search  <query...> [--team T] [--channel C] [--from USER] [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--limit N] [--or] [common]
   mmcli reply   <link|post_id> <message...> [common]
-  mmcli post    <~channel|@user|link> <message...> [--team T] [common]
+  mmcli post    <channel|~channel|@user|link> <message...> [--team T] [common]
   mmcli delete  <link|post_id> [common]
   mmcli version
 
@@ -45,6 +45,7 @@ Notes:
 login password sources (first non-empty wins):
   --password VALUE (insecure; visible in ps), --password-stdin (first stdin line),
   $MMCLI_PASSWORD, then a line read from stdin.
+  post @user sends a direct message; --team does not apply there.
   login makes the context current only if none is current yet, or with --use.
   Bot accounts cannot log in with a password: use --token-stdin with a personal
   access token. A token context never re-logs-in; a rejected token is an error.

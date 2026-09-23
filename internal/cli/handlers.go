@@ -74,7 +74,7 @@ func cmdLogin(d deps, args []string) error {
 	}
 	cfg.Set(*name, config.Context{URL: strings.TrimRight(*url, "/"), LoginID: *loginID, DefaultTeam: *team})
 	if *use {
-		cfg.CurrentName = *name
+		_ = cfg.Use(*name)
 	}
 	if err := cfg.Save(); err != nil {
 		return err
@@ -127,7 +127,7 @@ func loginWithToken(d deps, name, url, team string, use, pretty bool) error {
 	}
 	cfg.Set(name, config.Context{URL: strings.TrimRight(url, "/"), LoginID: me.Username, DefaultTeam: team, Auth: config.AuthToken})
 	if use {
-		cfg.CurrentName = name
+		_ = cfg.Use(name)
 	}
 	if err := cfg.Save(); err != nil {
 		return err
@@ -452,7 +452,7 @@ func cmdPost(d deps, args []string) error {
 		return err
 	}
 	if fs.NArg() < 2 {
-		return fmt.Errorf("usage: mmcli post <~channel|@user|link> <message...>")
+		return fmt.Errorf("usage: mmcli post <channel|~channel|@user|link> <message...>")
 	}
 	message := joinMessage(fs.Args()[1:])
 	if message == "" {
@@ -468,6 +468,9 @@ func cmdPost(d deps, args []string) error {
 
 	var channelID string
 	if username, ok := strings.CutPrefix(fs.Arg(0), "@"); ok {
+		if *team != "" {
+			return fmt.Errorf("--team does not apply to direct messages")
+		}
 		channelID, err = directChannelID(ctx, client, username)
 	} else {
 		channelID, err = teamChannelID(ctx, client, cc, *team, fs.Arg(0))
@@ -486,6 +489,11 @@ func cmdPost(d deps, args []string) error {
 // directChannelID returns the direct channel between the caller and username,
 // creating it if needed; direct channels belong to no team.
 func directChannelID(ctx context.Context, client *mm.Client, username string) (string, error) {
+	if username == "" {
+		return "", fmt.Errorf("empty username after @")
+	}
+	// The server stores usernames lowercase and rejects other spellings.
+	username = strings.ToLower(username)
 	me, err := client.Me(ctx)
 	if err != nil {
 		return "", err

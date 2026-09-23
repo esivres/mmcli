@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/esivres/mmcli/internal/config"
@@ -49,19 +48,23 @@ func postServer(t *testing.T, postedTo *string, directMembers *[]string) *httpte
 	return srv
 }
 
-func botDeps(t *testing.T, srvURL, team string) (deps, *strings.Builder) {
+// botDeps logs in a decoy "work" context first, so commands only reach the
+// bot when --context bot is honored.
+func botDeps(t *testing.T, srvURL, team string) deps {
 	t.Helper()
-	d, _, errOut := newDeps(t, secrets.NewMemory(), botToken+"\n")
-	args := []string{"login", "--context", "bot", "--url", srvURL, "--token-stdin"}
-	if team != "" {
-		args = append(args, "--team", team)
+	d, _, errOut := newDeps(t, secrets.NewMemory(), "")
+	for _, name := range []string{"work", "bot"} {
+		d.stdin = strings.NewReader(botToken + "\n")
+		args := []string{"login", "--context", name, "--url", srvURL, "--token-stdin"}
+		if team != "" {
+			args = append(args, "--team", team)
+		}
+		if code := run(d, args); code != 0 {
+			t.Fatalf("login %s exit %d: %s", name, code, errOut)
+		}
 	}
-	if code := run(d, args); code != 0 {
-		t.Fatalf("login exit %d: %s", code, errOut)
-	}
-	var out strings.Builder
-	d.stdout = &out
-	return d, &out
+	_ = d.store.Set(secrets.TokenKey("work"), "decoy")
+	return d
 }
 
 // @user must reach that user's direct channel without any team: that is how
@@ -70,7 +73,7 @@ func TestPostToUserUsesDirectChannel(t *testing.T) {
 	var postedTo string
 	var members []string
 	srv := postServer(t, &postedTo, &members)
-	d, _ := botDeps(t, srv.URL, "")
+	d := botDeps(t, srv.URL, "")
 
 	if code := run(d, []string{"post", "@alice", "digest", "--context", "bot"}); code != 0 {
 		t.Fatalf("post exit %d: %s", code, d.stderr)
@@ -88,7 +91,7 @@ func TestPostTildeChannel(t *testing.T) {
 	var postedTo string
 	var members []string
 	srv := postServer(t, &postedTo, &members)
-	d, _ := botDeps(t, srv.URL, "myteam")
+	d := botDeps(t, srv.URL, "myteam")
 
 	for _, target := range []string{"~ops", "ops"} {
 		postedTo = ""
@@ -102,40 +105,79 @@ func TestPostTildeChannel(t *testing.T) {
 }
 
 // Adding a second context must not redirect commands run without --context;
-// --use opts in explicitly.
+// --use opts in explicitly. Both login paths share the rule.
 func TestLoginKeepsCurrentContext(t *testing.T) {
-	var logins atomic.Int32
-	srv := fakeServer(t, &logins)
-	store := secrets.NewMemory()
-	d, _, errOut := newDeps(t, store, botToken+"\n")
-	login := func(name string, extra ...string) {
-		t.Helper()
-		d.stdin = strings.NewReader(botToken + "\n")
-		args := append([]string{"login", "--context", name, "--url", srv.URL, "--token-stdin"}, extra...)
-		if code := run(d, args); code != 0 {
-			t.Fatalf("login %s exit %d: %s", name, code, errOut)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v4/users/login":
+			w.Header().Set("Token", botToken)
+			_, _ = w.Write([]byte(`{"id":"u1","username":"me"}`))
+		case "/api/v4/users/me":
+			_, _ = w.Write([]byte(`{"id":"u1","username":"me"}`))
+		default:
+			http.NotFound(w, r)
 		}
+	}))
+	t.Cleanup(srv.Close)
+	modes := map[string][]string{
+		"password": {"--login-id", "me", "--password-stdin"},
+		"token":    {"--token-stdin"},
 	}
-	current := func() string {
-		t.Helper()
-		path, _ := config.DefaultPath()
-		cfg, err := config.Load(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return cfg.CurrentName
-	}
+	for mode, flags := range modes {
+		t.Run(mode, func(t *testing.T) {
+			d, _, errOut := newDeps(t, secrets.NewMemory(), "")
+			login := func(name string, extra ...string) {
+				t.Helper()
+				d.stdin = strings.NewReader(botToken + "\n")
+				args := append([]string{"login", "--context", name, "--url", srv.URL}, flags...)
+				if code := run(d, append(args, extra...)); code != 0 {
+					t.Fatalf("login %s exit %d: %s", name, code, errOut)
+				}
+			}
+			current := func() string {
+				t.Helper()
+				path, _ := config.DefaultPath()
+				cfg, err := config.Load(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return cfg.CurrentName
+			}
 
-	login("work")
-	if got := current(); got != "work" {
-		t.Fatalf("first login must become current, got %q", got)
+			login("work")
+			if got := current(); got != "work" {
+				t.Fatalf("first login must become current, got %q", got)
+			}
+			login("bot")
+			if got := current(); got != "work" {
+				t.Fatalf("second login switched current to %q", got)
+			}
+			login("bot", "--use")
+			if got := current(); got != "bot" {
+				t.Fatalf("--use must make the context current, got %q", got)
+			}
+		})
 	}
-	login("bot")
-	if got := current(); got != "work" {
-		t.Fatalf("second login switched current to %q", got)
+}
+
+// Username case and misuse of --team must be handled before any request that
+// could post to the wrong place.
+func TestPostToUserInputs(t *testing.T) {
+	var postedTo string
+	var members []string
+	srv := postServer(t, &postedTo, &members)
+	d := botDeps(t, srv.URL, "")
+
+	if code := run(d, []string{"post", "@Alice", "hi", "--context", "bot"}); code != 0 || postedTo != "dm1" {
+		t.Fatalf("@Alice should reach alice's DM: exit %d, posted to %q", code, postedTo)
 	}
-	login("bot", "--use")
-	if got := current(); got != "bot" {
-		t.Fatalf("--use must make the context current, got %q", got)
+	postedTo = ""
+	for _, args := range [][]string{
+		{"post", "@", "hi", "--context", "bot"},
+		{"post", "@alice", "hi", "--team", "myteam", "--context", "bot"},
+	} {
+		if code := run(d, args); code != 1 || postedTo != "" {
+			t.Fatalf("%v: want refusal without posting, got exit %d, posted to %q", args, code, postedTo)
+		}
 	}
 }

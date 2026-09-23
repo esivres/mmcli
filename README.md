@@ -98,7 +98,7 @@ mmcli search "релиз" --channel ops --from alice \
 
 ```sh
 mmcli reply <permalink|post_id> "текст ответа"   # тред: отвечает в корень нити
-mmcli post  <~channel|channel_link> "текст"      # новое сообщение в канал
+mmcli post  <channel|~channel|channel_link> "текст"  # новое сообщение в канал
 mmcli post  @username "текст"                   # личное сообщение (team не нужна)
 ```
 
