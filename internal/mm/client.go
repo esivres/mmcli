@@ -138,10 +138,11 @@ func (c *Client) doWithRetry(ctx context.Context, method, path string, in, out a
 	return nil
 }
 
-// IsUnauthorized reports a rejected token or failed login: retrying will not help.
+// IsUnauthorized reports a rejected token or failed login from Mattermost
+// itself (its errors carry an id); a proxy's 401 page may be transient.
 func IsUnauthorized(err error) bool {
 	var e *apiError
-	return errors.As(err, &e) && e.StatusCode == http.StatusUnauthorized
+	return errors.As(err, &e) && e.StatusCode == http.StatusUnauthorized && e.ID != ""
 }
 
 func decodeAPIError(resp *http.Response) error {

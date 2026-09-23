@@ -71,7 +71,8 @@ func (w *WSConn) Ping(ctx context.Context) error {
 	return w.conn.Ping(ctx)
 }
 
-// Close closes the connection.
-func (w *WSConn) Close() error {
-	return w.conn.Close(websocket.StatusNormalClosure, "")
+// CloseNow drops the connection without a close handshake, which could
+// otherwise stall on a dead peer.
+func (w *WSConn) CloseNow() error {
+	return w.conn.CloseNow()
 }

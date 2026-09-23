@@ -31,12 +31,14 @@ type wsScript struct {
 }
 
 type wsServer struct {
-	t       *testing.T
-	mu      sync.Mutex
-	users   map[string]string // token -> user id
-	scripts map[string][]wsScript
-	conns   map[string]int
-	queries map[string][]string
+	t            *testing.T
+	channelDelay time.Duration // slow REST lookups
+	dialHang     bool          // never answer the websocket upgrade
+	mu           sync.Mutex
+	users        map[string]string // token -> user id
+	scripts      map[string][]wsScript
+	conns        map[string]int
+	queries      map[string][]string
 }
 
 func newWSServer(t *testing.T) (*wsServer, *httptest.Server) {
@@ -54,6 +56,7 @@ func (ws *wsServer) handle(w http.ResponseWriter, r *http.Request) {
 	ws.mu.Unlock()
 	if !ok {
 		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"id":"api.context.session_expired.app_error","message":"Invalid or expired session","status_code":401}`))
 		return
 	}
 	switch {
@@ -62,9 +65,14 @@ func (ws *wsServer) handle(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/v4/users/ids":
 		_, _ = w.Write([]byte(`[{"id":"alice1","username":"alice"}]`))
 	case strings.HasPrefix(r.URL.Path, "/api/v4/channels/"):
+		time.Sleep(ws.channelDelay)
 		id := strings.TrimPrefix(r.URL.Path, "/api/v4/channels/")
 		fmt.Fprintf(w, `{"id":%q,"name":%q,"type":"O"}`, id, "name-"+id)
 	case r.URL.Path == "/api/v4/websocket":
+		if ws.dialHang {
+			<-r.Context().Done()
+			return
+		}
 		ws.mu.Lock()
 		n := ws.conns[tok]
 		ws.conns[tok]++
@@ -107,6 +115,12 @@ func (ws *wsServer) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// deletedEvent builds a "post_deleted" event: the server sends only the post.
+func deletedEvent(seq int64, id, channel string) map[string]any {
+	post, _ := json.Marshal(map[string]any{"id": id, "user_id": "alice1", "channel_id": channel, "message": "", "create_at": 1, "update_at": 3})
+	return map[string]any{"event": "post_deleted", "seq": seq, "data": map[string]any{"post": string(post)}}
 }
 
 // editedEvent builds a "post_edited" event: the server sends only the post.
@@ -164,9 +178,9 @@ func runStream(t *testing.T, srvURL string, ctxs []string, args []string, until 
 // beforeStream runs after login.
 func runStreamExit(t *testing.T, srvURL string, ctxs []string, args []string, until func([]map[string]any) bool, beforeStream func()) ([]map[string]any, int, string) {
 	t.Helper()
-	oldMin, oldFlush := reconnectMin, flushEvery
-	reconnectMin, flushEvery = 10*time.Millisecond, 10*time.Millisecond
-	t.Cleanup(func() { reconnectMin, flushEvery = oldMin, oldFlush })
+	oldMin, oldFlush, oldGrace := reconnectMin, flushEvery, resumeGrace
+	reconnectMin, flushEvery, resumeGrace = 10*time.Millisecond, 10*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { reconnectMin, flushEvery, resumeGrace = oldMin, oldFlush, oldGrace })
 
 	d, _, errOut := newDeps(t, secrets.NewMemory(), "")
 	for _, name := range ctxs {
@@ -418,11 +432,11 @@ func TestStreamDetectsHalfOpenConnection(t *testing.T) {
 func TestStreamEditFollowsMentionedPost(t *testing.T) {
 	ws, srv := newWSServer(t)
 	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", hold: true, events: []map[string]any{
-		postedEvent(1, "p1", "c1", "bot1"), editedEvent(2, "p1", "c1")}}}
+		postedEvent(1, "p1", "c1", "bot1"), editedEvent(2, "p1", "c1"), deletedEvent(3, "p1", "c1")}}}
 	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot", "--mention"}, func(l []map[string]any) bool {
-		return len(events(l, "post_edited")) == 1
+		return len(events(l, "post_deleted")) == 1
 	})
-	if got, want := sequence(lines), "connected posted:p1 post_edited:p1"; got != want {
+	if got, want := sequence(lines), "connected posted:p1 post_edited:p1 post_deleted:p1"; got != want {
 		t.Fatalf("lines\n got %s\nwant %s", got, want)
 	}
 }
@@ -460,5 +474,53 @@ func TestStreamReportsFailedContext(t *testing.T) {
 	lines, code, _ = runStreamExit(t, srv2.URL, []string{"bot"}, []string{"--context", "bot"}, never, nil)
 	if code != 1 || len(events(lines, "failed")) != 1 {
 		t.Fatalf("last context lost: want exit 1 after a failed line, got %d: %s", code, sequence(lines))
+	}
+}
+
+// Slow REST lookups must not starve pong handling and drop a live connection.
+func TestStreamSlowLookupsKeepConnection(t *testing.T) {
+	oldEvery, oldTimeout := pingEvery, pingTimeout
+	pingEvery, pingTimeout = 50*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { pingEvery, pingTimeout = oldEvery, oldTimeout })
+	ws, srv := newWSServer(t)
+	ws.channelDelay = 400 * time.Millisecond
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", hold: true, events: []map[string]any{
+		postedEvent(1, "p1", "c1"), postedEvent(2, "p2", "c2")}}}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
+		return len(posts(l)) == 2
+	})
+	if got, want := sequence(lines), "connected posted:p1 posted:p2"; got != want {
+		t.Fatalf("lines\n got %s\nwant %s", got, want)
+	}
+}
+
+// A server that never completes the websocket handshake must surface as a
+// disconnect, not a silent hang.
+func TestStreamDialTimeout(t *testing.T) {
+	oldRest := restTimeout
+	restTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { restTimeout = oldRest })
+	ws, srv := newWSServer(t)
+	ws.dialHang = true
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
+		return len(events(l, "disconnected")) > 0
+	})
+	if len(events(lines, "disconnected")) == 0 {
+		t.Fatalf("hanging dial not reported: %s", sequence(lines))
+	}
+}
+
+// A resume that replays nothing is still a working connection.
+func TestStreamResumeWithoutEventsConnects(t *testing.T) {
+	ws, srv := newWSServer(t)
+	ws.scripts["bot-tok"] = []wsScript{
+		{helloID: "c1", events: []map[string]any{postedEvent(1, "p1", "c1")}},
+		{noHello: true, hold: true},
+	}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
+		return len(events(l, "connected")) == 2
+	})
+	if got, want := sequence(lines), "connected posted:p1 disconnected connected"; got != want {
+		t.Fatalf("lines\n got %s\nwant %s", got, want)
 	}
 }

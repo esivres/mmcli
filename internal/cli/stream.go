@@ -29,6 +29,9 @@ var (
 	restTimeout = 30 * time.Second
 	// A failed channel/user lookup is retried after this, not per event.
 	lookupRetry = 5 * time.Minute
+	// After a resume that replays nothing the server stays silent; this long
+	// without a hello means the resume held.
+	resumeGrace = 2 * time.Second
 )
 
 const (
@@ -41,7 +44,7 @@ const (
 )
 
 // streamEvent is one JSONL line. Post events carry the rendered post; status
-// events (connected, disconnected, gap) carry context and detail instead.
+// events (connected, disconnected, gap, failed) carry context and detail.
 type streamEvent struct {
 	Event    string   `json:"event"`
 	Contexts []string `json:"contexts,omitempty"`
@@ -73,9 +76,11 @@ type streamFilter struct {
 	channels []string
 }
 
+func (f streamFilter) active() bool { return f.mention || f.dm || len(f.channels) > 0 }
+
 // matches reports whether an event passes; filters are OR-ed, none means all.
 func (f streamFilter) matches(mentioned bool, channelType, channelName string) bool {
-	if !f.mention && !f.dm && len(f.channels) == 0 {
+	if !f.active() {
 		return true
 	}
 	return (f.mention && mentioned) || (f.dm && channelType == "D") || slices.Contains(f.channels, channelName)
@@ -137,7 +142,7 @@ func cmdStream(d deps, args []string) error {
 			src.run(ctx, sightings)
 		}()
 	}
-	err := mergeStream(ctx, d, order, *window, sightings, len(sources))
+	err := mergeStream(ctx, d, order, *window, sightings, len(sources), filter.active())
 	cancel()
 	wg.Wait()
 	return err
@@ -146,12 +151,14 @@ func cmdStream(d deps, args []string) error {
 // mergeStream holds every line for window, collecting the contexts that saw a
 // post, then emits in arrival order. Status lines share the queue so they
 // never overtake posts received before them. It is the only stdout writer.
-func mergeStream(ctx context.Context, d deps, order []string, window time.Duration, sightings <-chan sighting, alive int) error {
+func mergeStream(ctx context.Context, d deps, order []string, window time.Duration, sightings <-chan sighting, alive int, filtering bool) error {
 	type pending struct {
 		first  time.Time
+		key    string
 		status *streamEvent
 		copies map[string]sighting
 	}
+	var lastCleanup time.Time
 	var queue []*pending
 	waiting := map[string]*pending{}
 	seen := map[string]time.Time{}
@@ -184,7 +191,9 @@ func mergeStream(ctx context.Context, d deps, order []string, window time.Durati
 		if !matched {
 			return nil
 		}
-		emitted[postKey] = now
+		if filtering {
+			emitted[postKey] = now
+		}
 		return output.Emit(d.stdout, out, false)
 	}
 
@@ -198,15 +207,16 @@ func mergeStream(ctx context.Context, d deps, order []string, window time.Durati
 				}
 				continue
 			}
-			for key := range p.copies {
-				delete(waiting, p.copies[key].key)
-				seen[p.copies[key].key] = now
-				break
-			}
+			delete(waiting, p.key)
+			seen[p.key] = now
 			if err := emitPost(p, now); err != nil {
 				return err
 			}
 		}
+		if now.Sub(lastCleanup) < time.Minute {
+			return nil
+		}
+		lastCleanup = now
 		for key, at := range seen {
 			if now.Sub(at) > seenTTL {
 				delete(seen, key)
@@ -250,7 +260,7 @@ func mergeStream(ctx context.Context, d deps, order []string, window time.Durati
 			}
 			p := waiting[s.key]
 			if p == nil {
-				p = &pending{first: now, copies: map[string]sighting{}}
+				p = &pending{first: now, key: s.key, copies: map[string]sighting{}}
 				waiting[s.key] = p
 				queue = append(queue, p)
 			}
@@ -264,12 +274,12 @@ func mergeStream(ctx context.Context, d deps, order []string, window time.Durati
 }
 
 type cachedChannel struct {
-	ch *mm.Channel // nil: lookup failed at
+	ch *mm.Channel // nil: lookup failed, retried after lookupRetry
 	at time.Time
 }
 
 type cachedUser struct {
-	name string // "": lookup failed at
+	name string // "": lookup failed, retried after lookupRetry
 	at   time.Time
 }
 
@@ -289,15 +299,14 @@ func (s *streamSource) run(ctx context.Context, sightings chan<- sighting) {
 	var connID string
 	var nextSeq int64
 	delay := reconnectMin
-	everConnected := false
-	for ctx.Err() == nil {
-		err := s.session(ctx, &connID, &nextSeq, sightings, func() { delay = reconnectMin; everConnected = true })
+	for attempt := 0; ctx.Err() == nil; attempt++ {
+		err := s.session(ctx, &connID, &nextSeq, sightings, func() { delay = reconnectMin })
 		if ctx.Err() != nil {
 			return
 		}
 		if mm.IsUnauthorized(err) {
 			select {
-			case sightings <- sighting{context: s.name, fatal: err, neverConnected: !everConnected}:
+			case sightings <- sighting{context: s.name, fatal: err, neverConnected: attempt == 0}:
 			case <-ctx.Done():
 			}
 			return
@@ -333,17 +342,37 @@ func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int
 	}
 	s.meID = me.ID
 	resuming := *connID != ""
-	conn, err := s.client.DialWS(ctx, *connID, *nextSeq)
+	dctx, dcancel := context.WithTimeout(ctx, restTimeout)
+	conn, err := s.client.DialWS(dctx, *connID, *nextSeq)
+	dcancel()
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 
-	pingErr := make(chan error, 1)
-	pingDone := make(chan struct{})
-	defer func() { cancel(); <-pingDone }()
+	// Pongs are handled only while reading, so reading never waits for REST
+	// lookups or a busy consumer; the buffer absorbs bursts.
+	events := make(chan *mm.WSEvent, 4096)
+	failed := make(chan error, 2)
+	var workers sync.WaitGroup
+	defer func() { cancel(); conn.CloseNow(); workers.Wait() }()
+	workers.Add(2)
 	go func() {
-		defer close(pingDone)
+		defer workers.Done()
+		for {
+			ev, err := conn.Next(ctx)
+			if err != nil {
+				failed <- err
+				return
+			}
+			select {
+			case events <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
 		t := time.NewTicker(pingEvery)
 		defer t.Stop()
 		for {
@@ -355,40 +384,46 @@ func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int
 				err := conn.Ping(pctx)
 				pcancel()
 				if err != nil && ctx.Err() == nil {
-					pingErr <- fmt.Errorf("no pong from server: %w", err)
-					cancel()
+					failed <- fmt.Errorf("no pong from server: %w", err)
 					return
 				}
 			}
 		}
 	}()
 
-	first := true
-	for {
-		ev, err := conn.Next(ctx)
-		if err != nil {
-			select {
-			case perr := <-pingErr:
-				return perr
-			default:
-				return err
-			}
-		}
-		if first {
-			// A resumed connection gets no hello; replayed events follow directly.
-			first = false
-			if ev.Event == "hello" {
-				var id string
-				_ = json.Unmarshal(ev.Data["connection_id"], &id)
-				if resuming && id != *connID {
-					s.status(ctx, sightings, "gap", "server could not resume the connection; events while disconnected are lost")
-					*nextSeq = 0
-				}
-				*connID = id
-			}
+	isConnected := false
+	markConnected := func() {
+		if !isConnected {
+			isConnected = true
 			connected()
 			s.status(ctx, sightings, "connected", "")
 		}
+	}
+	// A resumed connection gets no hello and, with nothing missed, no events.
+	var grace <-chan time.Time
+	if resuming {
+		grace = time.After(resumeGrace)
+	}
+	for {
+		var ev *mm.WSEvent
+		select {
+		case err := <-failed:
+			return err
+		case <-grace:
+			markConnected()
+			continue
+		case ev = <-events:
+		}
+		if ev.Event == "hello" {
+			var id string
+			_ = json.Unmarshal(ev.Data["connection_id"], &id)
+			if resuming && id != *connID {
+				s.status(ctx, sightings, "gap", "server could not resume the connection; events while disconnected are lost")
+				*nextSeq = 0
+			}
+			*connID = id
+		}
+		markConnected()
 		switch {
 		case ev.Seq < *nextSeq:
 			continue // replayed twice
@@ -429,9 +464,19 @@ func (s *streamSource) sighting(ctx context.Context, ev *mm.WSEvent) (sighting, 
 	ch := s.channel(ctx, p.ChannelID)
 	names := s.names(ctx, &p, ch)
 	rendered := output.One(&p, names)
+	// posted carries fresh channel data (renames included); edits and deletes
+	// rely on the cache.
 	var channelType, channelName string
+	_ = json.Unmarshal(ev.Data["channel_type"], &channelType)
+	_ = json.Unmarshal(ev.Data["channel_name"], &channelName)
 	if ch != nil {
-		channelType, channelName = ch.Type, ch.Name
+		if channelType == "" {
+			channelType, channelName = ch.Type, ch.Name
+		} else if ch.Name != channelName {
+			fresh := *ch
+			fresh.Name = channelName
+			s.channels[p.ChannelID] = cachedChannel{ch: &fresh, at: time.Now()}
+		}
 	}
 	return sighting{
 		context:   s.name,

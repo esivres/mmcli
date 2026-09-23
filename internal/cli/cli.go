@@ -56,7 +56,8 @@ login password sources (first non-empty wins):
   by several contexts of the same server is merged into one line after
   --merge-window: "contexts" lists who can see (and reply to) it, "mentions"
   whose user is mentioned. Filters are OR-ed (--channel takes the channel URL
-  name); none means every post; edits and deletes follow their post. Lines
+  name); none means every post; edits and deletes follow a post this run
+  emitted within 24h. Lines
   keep arrival order. Status lines:
   {"event":"connected"|"disconnected"|"gap","context","detail"}; a gap means
   events were lost (no resume, or skipped sequence numbers). A rejected token
