@@ -28,13 +28,15 @@ Usage:
   mmcli reply   <link|post_id> [message...] [--file PATH]... [common]
   mmcli post    <channel|~channel|@user|link> [message...] [--file PATH]... [--team T] [common]
   mmcli delete  <link|post_id> [common]
+  mmcli channels [--team T] [--since TIME] [--unread] [common]
+  mmcli threads [--team T] [--since TIME] [--unread] [--limit N | --all] [common]
   mmcli stream  [--context NAME]... [--mention] [--dm] [--channel NAME]... [--merge-window 1.5s]
   mmcli file search <query...> [--ext EXT] [--channel C] [--from USER] [--after D] [--before D] [--limit N | --all] [common]
   mmcli file get  <file_id> [--out DIR] [common]
   mmcli file text <file_id> [--max-bytes N] [--out DIR] [common]
   mmcli version
 
-Common flags (get/thread/search/reply/post/file):
+Common flags (get/thread/search/reply/post/file/channels/threads):
   --context NAME   use a specific stored context (default: current)
   --pretty         indented JSON output (default: compact JSON)
 
@@ -78,6 +80,13 @@ login password sources (first non-empty wins):
   (needs pdftotext), zip (size/count/depth limits; skipped entries are
   listed). Long text keeps its start and end (--max-bytes). Images are
   refused: no OCR, view the file.
+  channels lists the caller's channels, direct and group messages included,
+  most recent post first: {"id","name","type","last_post_at","unread",
+  "mentions"}; unread counts thread replies too. threads lists the threads
+  the caller follows (collapsed reply threads), most recent reply first: the
+  root post plus "reply_count","last_reply_at","unread_replies",
+  "unread_mentions","participants". Both cover every team unless --team is
+  given; TIME is YYYY-MM-DD (UTC) or RFC3339.
   login makes the context current only if none is current yet, or with --use.
   Bot accounts cannot log in with a password: use --token-stdin with a personal
   access token. A token context never re-logs-in; a rejected token is an error.
@@ -146,6 +155,10 @@ func run(d deps, args []string) int {
 		err = cmdDelete(d, args[1:])
 	case "stream":
 		err = cmdStream(d, args[1:])
+	case "channels":
+		err = cmdChannels(d, args[1:])
+	case "threads":
+		err = cmdThreads(d, args[1:])
 	case "file":
 		err = cmdFile(d, args[1:])
 	case "version", "--version":
@@ -293,21 +306,27 @@ func namesFor(ctx context.Context, client *mm.Client, posts ...*mm.Post) output.
 		}
 	}
 	for id, ch := range channels {
-		var label string
-		switch {
-		case ch == nil:
-		case ch.Type == "D":
-			label = directLabel(ch.Name, meID, names.Users)
-		case ch.Type == "G":
-			label = ch.DisplayName
-		default:
-			label = ch.Name
+		if ch == nil {
+			continue
 		}
-		if label != "" {
+		if label := channelLabel(ch, meID, names.Users); label != "" {
 			names.Channels[id] = label
 		}
 	}
 	return names
+}
+
+// channelLabel is the readable name of a channel: its URL name, "@<the other
+// user>" for a direct message, the title for a group message.
+func channelLabel(ch *mm.Channel, meID string, users map[string]string) string {
+	switch ch.Type {
+	case "D":
+		return directLabel(ch.Name, meID, users)
+	case "G":
+		return ch.DisplayName
+	default:
+		return ch.Name
+	}
 }
 
 // directLabel renders a direct channel as "@<the other user>", or "" when the

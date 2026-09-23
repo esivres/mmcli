@@ -12,8 +12,10 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -419,4 +421,57 @@ func (c *Client) UsersByIDs(ctx context.Context, ids []string) ([]User, error) {
 		return nil, err
 	}
 	return users, nil
+}
+
+// MyTeams lists the teams the caller belongs to.
+func (c *Client) MyTeams(ctx context.Context) ([]Team, error) {
+	var teams []Team
+	if err := c.do(ctx, http.MethodGet, "/api/v4/users/me/teams", nil, &teams); err != nil {
+		return nil, err
+	}
+	return teams, nil
+}
+
+// MyChannels lists the caller's channels in a team, direct and group
+// messages included.
+func (c *Client) MyChannels(ctx context.Context, teamID string) ([]Channel, error) {
+	var chs []Channel
+	if err := c.do(ctx, http.MethodGet, "/api/v4/users/me/teams/"+teamID+"/channels", nil, &chs); err != nil {
+		return nil, err
+	}
+	return chs, nil
+}
+
+// MyChannelMembers returns the caller's read state for every channel of MyChannels.
+func (c *Client) MyChannelMembers(ctx context.Context, teamID string) ([]ChannelMember, error) {
+	var ms []ChannelMember
+	if err := c.do(ctx, http.MethodGet, "/api/v4/users/me/teams/"+teamID+"/channels/members", nil, &ms); err != nil {
+		return nil, err
+	}
+	return ms, nil
+}
+
+// ThreadsPerPage is the server's maximum page size for followed threads.
+const ThreadsPerPage = 200
+
+// MyThreads returns one page of threads the caller follows, most recent reply
+// first. since (ms, 0 = any) filters on the thread's last update, a superset
+// of its last reply; before is the last thread ID of the previous page.
+func (c *Client) MyThreads(ctx context.Context, teamID string, since int64, before string, unread bool) (*ThreadList, error) {
+	// Without extended the participants come back with empty usernames.
+	q := url.Values{"per_page": {strconv.Itoa(ThreadsPerPage)}, "extended": {"true"}}
+	if since > 0 {
+		q.Set("since", strconv.FormatInt(since, 10))
+	}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if unread {
+		q.Set("unread", "true")
+	}
+	var tl ThreadList
+	if err := c.do(ctx, http.MethodGet, "/api/v4/users/me/teams/"+teamID+"/threads?"+q.Encode(), nil, &tl); err != nil {
+		return nil, err
+	}
+	return &tl, nil
 }

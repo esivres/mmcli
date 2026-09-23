@@ -54,7 +54,32 @@ type Channel struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
 	// Type is O (public), P (private), D (direct) or G (group message).
-	Type string `json:"type"`
+	Type          string `json:"type"`
+	LastPostAt    int64  `json:"last_post_at"`
+	TotalMsgCount int64  `json:"total_msg_count"`
+}
+
+// ChannelMember is the caller's read state in a channel (subset).
+type ChannelMember struct {
+	ChannelID    string `json:"channel_id"`
+	MsgCount     int64  `json:"msg_count"`
+	MentionCount int64  `json:"mention_count"`
+}
+
+// Thread is a followed thread with the caller's read state (subset).
+type Thread struct {
+	ID             string `json:"id"`
+	ReplyCount     int64  `json:"reply_count"`
+	LastReplyAt    int64  `json:"last_reply_at"`
+	UnreadReplies  int64  `json:"unread_replies"`
+	UnreadMentions int64  `json:"unread_mentions"`
+	Participants   []User `json:"participants"`
+	Post           *Post  `json:"post"`
+}
+
+// ThreadList is a page of followed threads, most recent reply first.
+type ThreadList struct {
+	Threads []Thread `json:"threads"`
 }
 
 // User is a Mattermost user (subset).
