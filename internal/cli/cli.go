@@ -17,15 +17,15 @@ import (
 const usage = `mmcli — console Mattermost client
 
 Usage:
-  mmcli login   --url URL --login-id ID [--context NAME] [--team TEAM] [--password-stdin]
-  mmcli login   --url URL --token-stdin [--context NAME] [--team TEAM]
+  mmcli login   --url URL --login-id ID [--context NAME] [--team TEAM] [--password-stdin] [--use]
+  mmcli login   --url URL --token-stdin [--context NAME] [--team TEAM] [--use]
   mmcli logout  [--context NAME]
   mmcli context list | use NAME | current
   mmcli get     <link|post_id> [--thread] [common]
   mmcli thread  <link|post_id> [common]
   mmcli search  <query...> [--team T] [--channel C] [--from USER] [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--limit N] [--or] [common]
   mmcli reply   <link|post_id> <message...> [common]
-  mmcli post    <channel|link> <message...> [--team T] [common]
+  mmcli post    <~channel|@user|link> <message...> [--team T] [common]
   mmcli delete  <link|post_id> [common]
   mmcli version
 
@@ -45,6 +45,7 @@ Notes:
 login password sources (first non-empty wins):
   --password VALUE (insecure; visible in ps), --password-stdin (first stdin line),
   $MMCLI_PASSWORD, then a line read from stdin.
+  login makes the context current only if none is current yet, or with --use.
   Bot accounts cannot log in with a password: use --token-stdin with a personal
   access token. A token context never re-logs-in; a rejected token is an error.
 
@@ -63,7 +64,8 @@ Examples:
   mmcli search "@me" --after 2026-06-01 --limit 20      # posts mentioning me
   mmcli search deploy --channel ops --from alice --before 2026-06-15
   mmcli reply <link|id> "looking into it"
-  mmcli post ops "deploy finished"`
+  mmcli post ~ops "deploy finished"
+  mmcli post @alice "digest is ready" --context bot   # direct message`
 
 // Version is set at release time via -ldflags.
 var Version = "dev"

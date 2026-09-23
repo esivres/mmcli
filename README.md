@@ -60,6 +60,9 @@ printf '%s' "$BOT_TOKEN" | mmcli login \
 
 Несколько серверов хранятся как именованные контексты в
 `$XDG_CONFIG_HOME/mmcli/config.json` (только не-секретные поля).
+`login` делает контекст текущим, только если текущего ещё нет или передан
+`--use`: добавление второго контекста (например, бота) не перенаправляет
+команды без `--context`.
 
 ```sh
 mmcli context list
@@ -95,7 +98,8 @@ mmcli search "релиз" --channel ops --from alice \
 
 ```sh
 mmcli reply <permalink|post_id> "текст ответа"   # тред: отвечает в корень нити
-mmcli post  <channel|channel_link> "текст"       # новое сообщение в канал
+mmcli post  <~channel|channel_link> "текст"      # новое сообщение в канал
+mmcli post  @username "текст"                   # личное сообщение (team не нужна)
 ```
 
 ## Вывод

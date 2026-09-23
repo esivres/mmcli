@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -26,6 +27,7 @@ func cmdLogin(d deps, args []string) error {
 	password := fs.String("password", "", "password (insecure; prefer --password-stdin)")
 	passwordStdin := fs.Bool("password-stdin", false, "read password from the first line of stdin")
 	tokenStdin := fs.Bool("token-stdin", false, "read a personal access token from the first line of stdin (bot accounts)")
+	use := fs.Bool("use", false, "make this context current")
 	pretty := fs.Bool("pretty", false, "indented JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -34,7 +36,7 @@ func cmdLogin(d deps, args []string) error {
 		if *password != "" || *passwordStdin || *loginID != "" {
 			return fmt.Errorf("--token-stdin cannot be combined with --login-id or password flags")
 		}
-		return loginWithToken(d, *name, *url, *team, *pretty)
+		return loginWithToken(d, *name, *url, *team, *use, *pretty)
 	}
 	if *url == "" || *loginID == "" {
 		return fmt.Errorf("--url and --login-id are required")
@@ -71,6 +73,9 @@ func cmdLogin(d deps, args []string) error {
 		return err
 	}
 	cfg.Set(*name, config.Context{URL: strings.TrimRight(*url, "/"), LoginID: *loginID, DefaultTeam: *team})
+	if *use {
+		cfg.CurrentName = *name
+	}
 	if err := cfg.Save(); err != nil {
 		return err
 	}
@@ -80,11 +85,12 @@ func cmdLogin(d deps, args []string) error {
 		"context": *name,
 		"url":     *url,
 		"login":   *loginID,
+		"current": cfg.CurrentName == *name,
 	}, *pretty)
 }
 
 // loginWithToken validates a personal access token and stores a token context.
-func loginWithToken(d deps, name, url, team string, pretty bool) error {
+func loginWithToken(d deps, name, url, team string, use, pretty bool) error {
 	if url == "" {
 		return fmt.Errorf("--url is required")
 	}
@@ -120,6 +126,9 @@ func loginWithToken(d deps, name, url, team string, pretty bool) error {
 		return err
 	}
 	cfg.Set(name, config.Context{URL: strings.TrimRight(url, "/"), LoginID: me.Username, DefaultTeam: team, Auth: config.AuthToken})
+	if use {
+		cfg.CurrentName = name
+	}
 	if err := cfg.Save(); err != nil {
 		return err
 	}
@@ -134,6 +143,7 @@ func loginWithToken(d deps, name, url, team string, pretty bool) error {
 		"url":     url,
 		"login":   me.Username,
 		"auth":    config.AuthToken,
+		"current": cfg.CurrentName == name,
 	}, pretty)
 }
 
@@ -430,7 +440,8 @@ func cmdDelete(d deps, args []string) error {
 	return output.Emit(d.stdout, map[string]any{"status": "ok", "deleted": ref.PostID}, c.pretty)
 }
 
-// cmdPost posts a new message to a channel (by name or channel link).
+// cmdPost posts a new message to a channel (~name, name or channel link) or,
+// for @username, to the direct channel with that user.
 func cmdPost(d deps, args []string) error {
 	fs := flag.NewFlagSet("post", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
@@ -441,7 +452,7 @@ func cmdPost(d deps, args []string) error {
 		return err
 	}
 	if fs.NArg() < 2 {
-		return fmt.Errorf("usage: mmcli post <channel|link> <message...>")
+		return fmt.Errorf("usage: mmcli post <~channel|@user|link> <message...>")
 	}
 	message := joinMessage(fs.Args()[1:])
 	if message == "" {
@@ -455,25 +466,56 @@ func cmdPost(d deps, args []string) error {
 	ctx, cancel := newCtx()
 	defer cancel()
 
-	// The first positional may be a channel link or a bare channel name.
-	channelName := fs.Arg(0)
-	teamFromLink := ""
-	if ref, err := link.Parse(fs.Arg(0)); err == nil && ref.ChannelName != "" {
-		channelName = ref.ChannelName
-		teamFromLink = ref.Team
+	var channelID string
+	if username, ok := strings.CutPrefix(fs.Arg(0), "@"); ok {
+		channelID, err = directChannelID(ctx, client, username)
+	} else {
+		channelID, err = teamChannelID(ctx, client, cc, *team, fs.Arg(0))
 	}
-	teamID, err := resolveTeamID(ctx, client, cc, *team, teamFromLink)
 	if err != nil {
 		return err
 	}
-	ch, err := client.GetChannelByName(ctx, teamID, channelName)
-	if err != nil {
-		return fmt.Errorf("resolve channel %q: %w", channelName, err)
-	}
-	created, err := client.CreatePost(ctx, ch.ID, message, "")
+	created, err := client.CreatePost(ctx, channelID, message, "")
 	if err != nil {
 		return err
 	}
 	names := resolveUsernames(ctx, client, []string{created.UserID})
 	return output.Emit(d.stdout, output.One(created, names), c.pretty)
+}
+
+// directChannelID returns the direct channel between the caller and username,
+// creating it if needed; direct channels belong to no team.
+func directChannelID(ctx context.Context, client *mm.Client, username string) (string, error) {
+	me, err := client.Me(ctx)
+	if err != nil {
+		return "", err
+	}
+	u, err := client.GetUserByUsername(ctx, username)
+	if err != nil {
+		return "", fmt.Errorf("resolve user %q: %w", username, err)
+	}
+	ch, err := client.CreateDirectChannel(ctx, me.ID, u.ID)
+	if err != nil {
+		return "", fmt.Errorf("open direct channel with %q: %w", username, err)
+	}
+	return ch.ID, nil
+}
+
+// teamChannelID resolves a channel link, ~name or bare name within a team.
+func teamChannelID(ctx context.Context, client *mm.Client, cc config.Context, team, target string) (string, error) {
+	channelName := strings.TrimPrefix(target, "~")
+	teamFromLink := ""
+	if ref, err := link.Parse(target); err == nil && ref.ChannelName != "" {
+		channelName = ref.ChannelName
+		teamFromLink = ref.Team
+	}
+	teamID, err := resolveTeamID(ctx, client, cc, team, teamFromLink)
+	if err != nil {
+		return "", err
+	}
+	ch, err := client.GetChannelByName(ctx, teamID, channelName)
+	if err != nil {
+		return "", fmt.Errorf("resolve channel %q: %w", channelName, err)
+	}
+	return ch.ID, nil
 }

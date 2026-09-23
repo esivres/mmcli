@@ -236,6 +236,25 @@ func (c *Client) Me(ctx context.Context) (*User, error) {
 	return &u, nil
 }
 
+// GetUserByUsername resolves a user by username.
+func (c *Client) GetUserByUsername(ctx context.Context, username string) (*User, error) {
+	var u User
+	if err := c.do(ctx, http.MethodGet, "/api/v4/users/username/"+username, nil, &u); err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// CreateDirectChannel returns the direct channel between two users; the server
+// returns the existing one if it was created before.
+func (c *Client) CreateDirectChannel(ctx context.Context, userID, otherID string) (*Channel, error) {
+	var ch Channel
+	if err := c.do(ctx, http.MethodPost, "/api/v4/channels/direct", []string{userID, otherID}, &ch); err != nil {
+		return nil, err
+	}
+	return &ch, nil
+}
+
 // UsersByIDs resolves usernames for a set of user IDs.
 func (c *Client) UsersByIDs(ctx context.Context, ids []string) ([]User, error) {
 	if len(ids) == 0 {

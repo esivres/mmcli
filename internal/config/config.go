@@ -103,10 +103,14 @@ func (c *Config) Get(name string) (Context, bool) {
 	return ctx, ok
 }
 
-// Set stores/replaces a context and makes it current.
+// Set stores/replaces a context. It becomes current only when no valid
+// context is selected, so adding a second context never silently redirects
+// commands run without --context.
 func (c *Config) Set(name string, ctx Context) {
 	c.Contexts[name] = ctx
-	c.CurrentName = name
+	if _, ok := c.Contexts[c.CurrentName]; !ok || c.CurrentName == "" {
+		c.CurrentName = name
+	}
 }
 
 // Use switches the active context.
