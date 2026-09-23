@@ -1,0 +1,38 @@
+version: 2
+
+builds:
+  - main: ./cmd/mmcli
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+
+archives:
+  - formats: [tar.gz]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+
+homebrew_casks:
+  - name: mmcli
+    repository:
+      owner: esivres
+      name: mmcli
+      branch: main
+    directory: Casks
+    homepage: https://github.com/esivres/mmcli
+    description: Console Mattermost client for automation
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/mmcli"]
+          end
