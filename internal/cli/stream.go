@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,11 +22,23 @@ var (
 	reconnectMin = time.Second
 	reconnectMax = 30 * time.Second
 	flushEvery   = 100 * time.Millisecond
+	// The server pings every 60s; our own ping detects a half-open connection
+	// (sleep, NAT timeout) that would otherwise look alive and silent.
+	pingEvery   = 30 * time.Second
+	pingTimeout = 10 * time.Second
+	restTimeout = 30 * time.Second
+	// A failed channel/user lookup is retried after this, not per event.
+	lookupRetry = 5 * time.Minute
 )
 
-// seenTTL keeps delivered keys long enough to drop late duplicates and
-// replays after a resumed connection.
-const seenTTL = 10 * time.Minute
+const (
+	// seenTTL keeps delivered keys long enough to drop late duplicates and
+	// replays after a resumed connection.
+	seenTTL = 10 * time.Minute
+	// emittedTTL lets edits and deletes of an emitted post pass filters their
+	// events carry no data for (channel, mentions).
+	emittedTTL = 24 * time.Hour
+)
 
 // streamEvent is one JSONL line. Post events carry the rendered post; status
 // events (connected, disconnected, gap) carry context and detail instead.
@@ -39,13 +52,16 @@ type streamEvent struct {
 	Detail      string `json:"detail,omitempty"`
 }
 
-// sighting is one context's copy of a post event.
+// sighting is one context's copy of a post event, or a status line when
+// status is set.
 type sighting struct {
 	context   string
 	key       string
+	postKey   string // server|post id, shared by a post's posted/edited/deleted
 	matched   bool
 	mentioned bool
 	event     streamEvent
+	status    bool
 }
 
 type streamFilter struct {
@@ -74,7 +90,7 @@ func cmdStream(d deps, args []string) error {
 	fs.SetOutput(d.stderr)
 	var contexts, channels multiFlag
 	fs.Var(&contexts, "context", "context to stream from (repeatable; default: current)")
-	fs.Var(&channels, "channel", "only this channel name (repeatable)")
+	fs.Var(&channels, "channel", "only this channel (URL name, repeatable)")
 	mention := fs.Bool("mention", false, "only posts mentioning a streamed context's user")
 	dm := fs.Bool("dm", false, "only direct messages")
 	window := fs.Duration("merge-window", 1500*time.Millisecond, "how long to wait for copies of an event from other contexts")
@@ -92,10 +108,11 @@ func cmdStream(d deps, args []string) error {
 		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	var order []string
-	sightings := make(chan sighting)
-	status := make(chan streamEvent)
+	var sources []*streamSource
 	for _, name := range contexts {
 		client, ctxName, cc, err := d.buildClient(name)
 		if err != nil {
@@ -105,58 +122,96 @@ func cmdStream(d deps, args []string) error {
 			return fmt.Errorf("context %q given twice", ctxName)
 		}
 		order = append(order, ctxName)
-		src := &streamSource{name: ctxName, server: cc.URL, client: client, filter: filter,
-			names: output.Names{Users: map[string]string{}, Channels: map[string]string{}}}
-		go src.run(ctx, sightings, status)
+		sources = append(sources, &streamSource{name: ctxName, server: cc.URL, client: client, filter: filter,
+			channels: map[string]cachedChannel{}, users: map[string]cachedUser{}})
 	}
-	return mergeStream(ctx, d, order, *window, sightings, status)
+	sightings := make(chan sighting)
+	var wg sync.WaitGroup
+	for _, src := range sources {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			src.run(ctx, sightings)
+		}()
+	}
+	err := mergeStream(ctx, d, order, *window, sightings)
+	cancel()
+	wg.Wait()
+	return err
 }
 
-// mergeStream holds each post event for window, collecting the contexts that
-// saw it, then emits one line. It is the only writer to stdout.
-func mergeStream(ctx context.Context, d deps, order []string, window time.Duration, sightings <-chan sighting, status <-chan streamEvent) error {
+// mergeStream holds every line for window, collecting the contexts that saw a
+// post, then emits in arrival order. Status lines share the queue so they
+// never overtake posts received before them. It is the only stdout writer.
+func mergeStream(ctx context.Context, d deps, order []string, window time.Duration, sightings <-chan sighting) error {
 	type pending struct {
 		first  time.Time
+		status *streamEvent
 		copies map[string]sighting
 	}
+	var queue []*pending
 	waiting := map[string]*pending{}
 	seen := map[string]time.Time{}
+	emitted := map[string]time.Time{}
 	tick := time.NewTicker(flushEvery)
 	defer tick.Stop()
-	emit := func(ev streamEvent) error { return output.Emit(d.stdout, ev, false) }
 
-	flush := func(now time.Time, all bool) error {
-		for key, p := range waiting {
-			if !all && now.Sub(p.first) < window {
+	emitPost := func(p *pending, now time.Time) error {
+		var out streamEvent
+		matched := false
+		var postKey string
+		for _, name := range order {
+			s, ok := p.copies[name]
+			if !ok {
 				continue
 			}
-			delete(waiting, key)
-			seen[key] = now
-			var out streamEvent
-			matched := false
-			for _, name := range order {
-				s, ok := p.copies[name]
-				if !ok {
-					continue
-				}
-				if out.Event == "" {
-					out = s.event // the label is as seen by the first context in order
-				}
-				out.Contexts = append(out.Contexts, name)
-				if s.mentioned {
-					out.Mentions = append(out.Mentions, name)
-				}
-				matched = matched || s.matched
+			if out.Event == "" {
+				out = s.event // the label is as seen by the first context in order
+				postKey = s.postKey
 			}
-			if matched {
-				if err := emit(out); err != nil {
+			out.Contexts = append(out.Contexts, name)
+			if s.mentioned {
+				out.Mentions = append(out.Mentions, name)
+			}
+			matched = matched || s.matched
+		}
+		if _, ok := emitted[postKey]; ok && out.Event != "posted" {
+			matched = true
+		}
+		if !matched {
+			return nil
+		}
+		emitted[postKey] = now
+		return output.Emit(d.stdout, out, false)
+	}
+
+	flush := func(now time.Time, all bool) error {
+		for len(queue) > 0 && (all || now.Sub(queue[0].first) >= window) {
+			p := queue[0]
+			queue = queue[1:]
+			if p.status != nil {
+				if err := output.Emit(d.stdout, *p.status, false); err != nil {
 					return err
 				}
+				continue
+			}
+			for key := range p.copies {
+				delete(waiting, p.copies[key].key)
+				seen[p.copies[key].key] = now
+				break
+			}
+			if err := emitPost(p, now); err != nil {
+				return err
 			}
 		}
 		for key, at := range seen {
 			if now.Sub(at) > seenTTL {
 				delete(seen, key)
+			}
+		}
+		for key, at := range emitted {
+			if now.Sub(at) > emittedTTL {
+				delete(emitted, key)
 			}
 		}
 		return nil
@@ -166,18 +221,21 @@ func mergeStream(ctx context.Context, d deps, order []string, window time.Durati
 		select {
 		case <-ctx.Done():
 			return flush(time.Now(), true)
-		case ev := <-status:
-			if err := emit(ev); err != nil {
-				return err
-			}
 		case s := <-sightings:
+			now := time.Now()
+			if s.status {
+				ev := s.event
+				queue = append(queue, &pending{first: now, status: &ev})
+				continue
+			}
 			if _, done := seen[s.key]; done {
 				continue
 			}
 			p := waiting[s.key]
 			if p == nil {
-				p = &pending{first: time.Now(), copies: map[string]sighting{}}
+				p = &pending{first: now, copies: map[string]sighting{}}
 				waiting[s.key] = p
+				queue = append(queue, p)
 			}
 			p.copies[s.context] = s
 		case now := <-tick.C:
@@ -188,33 +246,38 @@ func mergeStream(ctx context.Context, d deps, order []string, window time.Durati
 	}
 }
 
-// streamSource keeps one context's websocket alive and turns its events into
-// sightings.
-type streamSource struct {
-	name   string
-	server string
-	client *mm.Client
-	filter streamFilter
-	meID   string
-	names  output.Names // cache: channel labels and usernames seen so far
+type cachedChannel struct {
+	ch *mm.Channel // nil: lookup failed at
+	at time.Time
 }
 
-func (s *streamSource) run(ctx context.Context, sightings chan<- sighting, status chan<- streamEvent) {
+type cachedUser struct {
+	name string // "": lookup failed at
+	at   time.Time
+}
+
+// streamSource keeps one context's websocket alive and turns its events into
+// sightings. Its caches are touched only by its own goroutine.
+type streamSource struct {
+	name     string
+	server   string
+	client   *mm.Client
+	filter   streamFilter
+	meID     string
+	channels map[string]cachedChannel
+	users    map[string]cachedUser
+}
+
+func (s *streamSource) run(ctx context.Context, sightings chan<- sighting) {
 	var connID string
 	var nextSeq int64
 	delay := reconnectMin
-	send := func(event, detail string) {
-		select {
-		case status <- streamEvent{Event: event, Context: s.name, Detail: detail}:
-		case <-ctx.Done():
-		}
-	}
 	for ctx.Err() == nil {
-		err := s.session(ctx, &connID, &nextSeq, sightings, send, func() { delay = reconnectMin })
+		err := s.session(ctx, &connID, &nextSeq, sightings, func() { delay = reconnectMin })
 		if ctx.Err() != nil {
 			return
 		}
-		send("disconnected", err.Error())
+		s.status(ctx, sightings, "disconnected", err.Error())
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
@@ -224,37 +287,88 @@ func (s *streamSource) run(ctx context.Context, sightings chan<- sighting, statu
 	}
 }
 
+func (s *streamSource) status(ctx context.Context, sightings chan<- sighting, event, detail string) {
+	select {
+	case sightings <- sighting{status: true, event: streamEvent{Event: event, Context: s.name, Detail: detail}}:
+	case <-ctx.Done():
+	}
+}
+
 // session runs one websocket connection until it fails.
-func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int64, sightings chan<- sighting, send func(event, detail string), connected func()) error {
+func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int64, sightings chan<- sighting, connected func()) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// A REST call first lets password contexts re-login and refresh the token.
-	me, err := s.client.Me(ctx)
+	rctx, rcancel := context.WithTimeout(ctx, restTimeout)
+	me, err := s.client.Me(rctx)
+	rcancel()
 	if err != nil {
 		return err
 	}
 	s.meID = me.ID
+	resuming := *connID != ""
 	conn, err := s.client.DialWS(ctx, *connID, *nextSeq)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+
+	pingErr := make(chan error, 1)
+	pingDone := make(chan struct{})
+	defer func() { cancel(); <-pingDone }()
+	go func() {
+		defer close(pingDone)
+		t := time.NewTicker(pingEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				pctx, pcancel := context.WithTimeout(ctx, pingTimeout)
+				err := conn.Ping(pctx)
+				pcancel()
+				if err != nil && ctx.Err() == nil {
+					pingErr <- fmt.Errorf("no pong from server: %w", err)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	first := true
 	for {
 		ev, err := conn.Next(ctx)
 		if err != nil {
-			return err
-		}
-		if ev.Event == "hello" {
-			var id string
-			_ = json.Unmarshal(ev.Data["connection_id"], &id)
-			if *connID != "" && id != *connID {
-				send("gap", "server could not resume the connection; events while disconnected are lost")
-				*nextSeq = 0
+			select {
+			case perr := <-pingErr:
+				return perr
+			default:
+				return err
 			}
-			*connID = id
-			connected()
-			send("connected", "")
 		}
-		if ev.Seq != *nextSeq {
-			send("gap", fmt.Sprintf("missed events %d..%d", *nextSeq, ev.Seq-1))
+		if first {
+			// A resumed connection gets no hello; replayed events follow directly.
+			first = false
+			if ev.Event == "hello" {
+				var id string
+				_ = json.Unmarshal(ev.Data["connection_id"], &id)
+				if resuming && id != *connID {
+					s.status(ctx, sightings, "gap", "server could not resume the connection; events while disconnected are lost")
+					*nextSeq = 0
+				}
+				*connID = id
+			}
+			connected()
+			s.status(ctx, sightings, "connected", "")
+		}
+		switch {
+		case ev.Seq < *nextSeq:
+			continue // replayed twice
+		case ev.Seq > *nextSeq:
+			s.status(ctx, sightings, "gap", fmt.Sprintf("missed events: %d", ev.Seq-*nextSeq))
 		}
 		*nextSeq = ev.Seq + 1
 
@@ -280,31 +394,91 @@ func (s *streamSource) sighting(ctx context.Context, ev *mm.WSEvent) (sighting, 
 	if json.Unmarshal(ev.Data["post"], &raw) != nil || json.Unmarshal([]byte(raw), &p) != nil {
 		return sighting{}, false
 	}
-	var channelType, channelName, mentionsRaw string
-	_ = json.Unmarshal(ev.Data["channel_type"], &channelType)
-	_ = json.Unmarshal(ev.Data["channel_name"], &channelName)
+	// Only posted carries mentions; edits and deletes pass via emitted posts.
+	var mentionsRaw string
 	_ = json.Unmarshal(ev.Data["mentions"], &mentionsRaw)
 	var mentions []string
 	_ = json.Unmarshal([]byte(mentionsRaw), &mentions)
 	mentioned := slices.Contains(mentions, s.meID)
 
-	if _, ok := s.names.Channels[p.ChannelID]; !ok || s.names.Users[p.UserID] == "" {
-		n := namesFor(ctx, s.client, &p)
-		for k, v := range n.Channels {
-			s.names.Channels[k] = v
-		}
-		for k, v := range n.Users {
-			s.names.Users[k] = v
-		}
-		// Cache misses too, so an unlabeled channel is not refetched per event.
-		s.names.Channels[p.ChannelID] = n.Channels[p.ChannelID]
+	ch := s.channel(ctx, p.ChannelID)
+	names := s.names(ctx, &p, ch)
+	rendered := output.One(&p, names)
+	var channelType, channelName string
+	if ch != nil {
+		channelType, channelName = ch.Type, ch.Name
 	}
-	rendered := output.One(&p, s.names)
 	return sighting{
 		context:   s.name,
 		key:       fmt.Sprintf("%s|%s|%s|%d", s.server, ev.Event, p.ID, p.UpdateAt),
+		postKey:   s.server + "|" + p.ID,
 		matched:   s.filter.matches(mentioned, channelType, channelName),
 		mentioned: mentioned,
 		event:     streamEvent{Event: ev.Event, RenderedPost: &rendered, ChannelType: channelType},
 	}, true
+}
+
+// channel returns the cached channel, fetching it at most once per lookupRetry.
+func (s *streamSource) channel(ctx context.Context, id string) *mm.Channel {
+	if c, ok := s.channels[id]; ok && (c.ch != nil || time.Since(c.at) < lookupRetry) {
+		return c.ch
+	}
+	rctx, cancel := context.WithTimeout(ctx, restTimeout)
+	defer cancel()
+	ch, err := s.client.GetChannel(rctx, id)
+	if err != nil {
+		ch = nil
+	}
+	s.channels[id] = cachedChannel{ch: ch, at: time.Now()}
+	return ch
+}
+
+// names resolves the author and the channel label of p from the caches.
+func (s *streamSource) names(ctx context.Context, p *mm.Post, ch *mm.Channel) output.Names {
+	ids := []string{p.UserID}
+	if ch != nil && ch.Type == "D" {
+		ids = append(ids, strings.Split(ch.Name, "__")...)
+	}
+	var missing []string
+	for _, id := range ids {
+		if u, ok := s.users[id]; !ok || (u.name == "" && time.Since(u.at) >= lookupRetry) {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		rctx, cancel := context.WithTimeout(ctx, restTimeout)
+		users, err := s.client.UsersByIDs(rctx, missing)
+		cancel()
+		now := time.Now()
+		for _, id := range missing {
+			s.users[id] = cachedUser{at: now}
+		}
+		if err == nil {
+			for _, u := range users {
+				s.users[u.ID] = cachedUser{name: u.Username, at: now}
+			}
+		}
+	}
+
+	names := output.Names{Users: map[string]string{}, Channels: map[string]string{}}
+	for _, id := range ids {
+		if n := s.users[id].name; n != "" {
+			names.Users[id] = n
+		}
+	}
+	if ch != nil {
+		var label string
+		switch ch.Type {
+		case "D":
+			label = directLabel(ch.Name, s.meID, names.Users)
+		case "G":
+			label = ch.DisplayName
+		default:
+			label = ch.Name
+		}
+		if label != "" {
+			names.Channels[p.ChannelID] = label
+		}
+	}
+	return names
 }

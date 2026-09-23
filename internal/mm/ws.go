@@ -24,9 +24,6 @@ type WSConn struct {
 	conn *websocket.Conn
 }
 
-// Token returns the current session or access token.
-func (c *Client) Token() string { return c.token }
-
 // DialWS opens the event websocket. A non-empty connID with nextSeq asks the
 // server to resume that connection and replay events from nextSeq.
 func (c *Client) DialWS(ctx context.Context, connID string, nextSeq int64) (*WSConn, error) {
@@ -67,6 +64,11 @@ func (w *WSConn) Next(ctx context.Context) (*WSEvent, error) {
 			return &ev, nil
 		}
 	}
+}
+
+// Ping sends a ping and waits for the pong; it needs a concurrent Next.
+func (w *WSConn) Ping(ctx context.Context) error {
+	return w.conn.Ping(ctx)
 }
 
 // Close closes the connection.

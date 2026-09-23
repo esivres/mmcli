@@ -22,8 +22,11 @@ import (
 type wsScript struct {
 	helloID  string
 	helloSeq int64
+	noHello  bool // a successful resume: the server sends no hello
+	delay    time.Duration
 	events   []map[string]any
 	hold     bool
+	deaf     bool // never reads, so pings go unanswered
 }
 
 type wsServer struct {
@@ -75,11 +78,17 @@ func (ws *wsServer) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ctx := r.Context()
+		if !sc.deaf {
+			ctx = c.CloseRead(ctx)
+		}
 		send := func(v any) {
 			b, _ := json.Marshal(v)
 			_ = c.Write(ctx, websocket.MessageText, b)
 		}
-		send(map[string]any{"event": "hello", "seq": sc.helloSeq, "data": map[string]any{"connection_id": sc.helloID}})
+		if !sc.noHello {
+			send(map[string]any{"event": "hello", "seq": sc.helloSeq, "data": map[string]any{"connection_id": sc.helloID}})
+		}
+		time.Sleep(sc.delay)
 		for _, ev := range sc.events {
 			send(ev)
 		}
@@ -90,6 +99,12 @@ func (ws *wsServer) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// editedEvent builds a "post_edited" event: the server sends only the post.
+func editedEvent(seq int64, id, channel string) map[string]any {
+	post, _ := json.Marshal(map[string]any{"id": id, "user_id": "alice1", "channel_id": channel, "message": "edited", "create_at": 1, "update_at": 2})
+	return map[string]any{"event": "post_edited", "seq": seq, "data": map[string]any{"post": string(post)}}
 }
 
 // postedEvent builds a "posted" websocket event as the server sends it.
@@ -236,34 +251,152 @@ func TestStreamMentionFilter(t *testing.T) {
 	}
 }
 
-// A dropped connection must be resumed from the next sequence number without
-// a gap; if the server cannot resume, the loss must be reported.
+func events(lines []map[string]any, kind string) []map[string]any {
+	var out []map[string]any
+	for _, l := range lines {
+		if l["event"] == kind {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func sequence(lines []map[string]any) string {
+	var parts []string
+	for _, l := range lines {
+		if id, ok := l["id"]; ok {
+			parts = append(parts, fmt.Sprint(l["event"], ":", id))
+		} else {
+			parts = append(parts, fmt.Sprint(l["event"]))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// A dropped connection must be resumed from the next sequence number; the
+// server sends no hello then. If it cannot resume, the loss must be reported.
 func TestStreamResumeAndGap(t *testing.T) {
 	ws, srv := newWSServer(t)
 	ws.scripts["bot-tok"] = []wsScript{
 		{helloID: "c1", events: []map[string]any{postedEvent(1, "p1", "c1")}},
-		{helloID: "c1", helloSeq: 2, events: []map[string]any{postedEvent(3, "p2", "c1")}},
+		{noHello: true, events: []map[string]any{postedEvent(2, "p2", "c1")}},
 		{helloID: "c2", hold: true},
 	}
 	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
-		return len(posts(l)) == 2 && strings.Count(fmt.Sprint(l), "event:gap") >= 1
+		return len(events(l, "connected")) == 3
 	})
 	ws.mu.Lock()
 	q := ws.queries["bot-tok"]
 	ws.mu.Unlock()
-	if len(q) < 3 || q[0] != "" || q[1] != "connection_id=c1&sequence_number=2" || q[2] != "connection_id=c1&sequence_number=4" {
+	if len(q) < 3 || q[0] != "" || q[1] != "connection_id=c1&sequence_number=2" || q[2] != "connection_id=c1&sequence_number=3" {
 		t.Fatalf("reconnect queries %q", q)
 	}
-	var gaps int
-	for _, l := range lines {
-		if l["event"] == "gap" {
-			gaps++
+	want := "connected posted:p1 disconnected connected posted:p2 disconnected gap connected"
+	if got := sequence(lines); got != want {
+		t.Fatalf("lines\n got %s\nwant %s", got, want)
+	}
+	if d := events(lines, "gap")[0]["detail"]; !strings.Contains(fmt.Sprint(d), "could not resume") {
+		t.Fatalf("gap detail %v", d)
+	}
+}
+
+// Missing sequence numbers inside a live connection are lost events too.
+func TestStreamSeqGapInConnection(t *testing.T) {
+	ws, srv := newWSServer(t)
+	// The replayed p1 must not rewind the sequence and fake a gap before p5.
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "c1", hold: true, events: []map[string]any{
+		postedEvent(1, "p1", "c1"), postedEvent(4, "p4", "c1"), postedEvent(1, "p1", "c1"), postedEvent(5, "p5", "c1")}}}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
+		return len(posts(l)) == 3
+	})
+	if got, want := sequence(lines), "connected posted:p1 gap posted:p4 posted:p5"; got != want {
+		t.Fatalf("lines\n got %s\nwant %s", got, want)
+	}
+	if d := events(lines, "gap")[0]["detail"]; d != "missed events: 2" {
+		t.Fatalf("gap detail %v", d)
+	}
+}
+
+// A copy arriving after the merge window must not produce a second line.
+func TestStreamDropsLateDuplicate(t *testing.T) {
+	ws, srv := newWSServer(t)
+	ws.scripts["work-tok"] = []wsScript{{helloID: "w", hold: true, events: []map[string]any{postedEvent(1, "p1", "c1")}}}
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", hold: true, delay: 500 * time.Millisecond,
+		events: []map[string]any{postedEvent(1, "p1", "c1"), postedEvent(2, "p2", "c1")}}}
+	lines := runStream(t, srv.URL, []string{"work", "bot"}, []string{"--context", "work", "--context", "bot"},
+		func(l []map[string]any) bool { return len(posts(l)) == 2 })
+	if n := len(events(lines, "posted")); n != 2 {
+		t.Fatalf("want p1 once and p2 once, got %s", sequence(lines))
+	}
+}
+
+// Edits carry no channel data; they must follow the post through filters.
+func TestStreamEditFollowsFilteredPost(t *testing.T) {
+	ws, srv := newWSServer(t)
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", hold: true, events: []map[string]any{
+		postedEvent(1, "p1", "c1"), postedEvent(2, "p2", "c2"), editedEvent(3, "p1", "c1"), editedEvent(4, "p2", "c2")}}}
+	var firstSeen time.Time
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot", "--channel", "name-c1"}, func(l []map[string]any) bool {
+		if len(events(l, "post_edited")) == 0 {
+			return false
 		}
+		if firstSeen.IsZero() {
+			firstSeen = time.Now()
+		}
+		return time.Since(firstSeen) > 300*time.Millisecond
+	})
+	if got, want := sequence(lines), "connected posted:p1 post_edited:p1"; got != want {
+		t.Fatalf("lines\n got %s\nwant %s", got, want)
 	}
-	if gaps != 1 {
-		t.Fatalf("want exactly one gap (the unresumable reconnect), got %d: %v", gaps, lines)
+	if ct := events(lines, "post_edited")[0]["channel_type"]; ct != "O" {
+		t.Fatalf("edit channel_type %v", ct)
 	}
-	if len(posts(lines)) != 2 {
-		t.Fatalf("posts %v", lines)
+}
+
+// Lines leave in arrival order even when many ripen in one flush.
+func TestStreamKeepsArrivalOrder(t *testing.T) {
+	ws, srv := newWSServer(t)
+	var evs []map[string]any
+	var want []string
+	for i := 1; i <= 30; i++ {
+		id := fmt.Sprintf("p%02d", i)
+		evs = append(evs, postedEvent(int64(i), id, "c1"))
+		want = append(want, "posted:"+id)
+	}
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", hold: true, events: evs}}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
+		return len(posts(l)) == 30
+	})
+	if got := sequence(lines); got != "connected "+strings.Join(want, " ") {
+		t.Fatalf("order broken: %s", got)
+	}
+}
+
+// A connection that stops answering pings must be dropped, not trusted.
+func TestStreamDetectsHalfOpenConnection(t *testing.T) {
+	oldEvery, oldTimeout := pingEvery, pingTimeout
+	pingEvery, pingTimeout = 50*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { pingEvery, pingTimeout = oldEvery, oldTimeout })
+	ws, srv := newWSServer(t)
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", hold: true, deaf: true}}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
+		return len(events(l, "disconnected")) > 0
+	})
+	d := events(lines, "disconnected")
+	if len(d) == 0 || !strings.Contains(fmt.Sprint(d[0]["detail"]), "no pong") {
+		t.Fatalf("half-open connection not detected: %s", sequence(lines))
+	}
+}
+
+// An edit carries no mentions; it must follow a post that passed --mention.
+func TestStreamEditFollowsMentionedPost(t *testing.T) {
+	ws, srv := newWSServer(t)
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", hold: true, events: []map[string]any{
+		postedEvent(1, "p1", "c1", "bot1"), editedEvent(2, "p1", "c1")}}}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot", "--mention"}, func(l []map[string]any) bool {
+		return len(events(l, "post_edited")) == 1
+	})
+	if got, want := sequence(lines), "connected posted:p1 post_edited:p1"; got != want {
+		t.Fatalf("lines\n got %s\nwant %s", got, want)
 	}
 }

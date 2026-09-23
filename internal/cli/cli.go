@@ -55,9 +55,11 @@ login password sources (first non-empty wins):
   stream prints one JSON line per live event until interrupted. A post seen
   by several contexts of the same server is merged into one line after
   --merge-window: "contexts" lists who can see (and reply to) it, "mentions"
-  whose user is mentioned. Filters are OR-ed; none means every post. Status
-  lines: {"event":"connected"|"disconnected"|"gap","context","detail"}; a gap
-  means events were lost.
+  whose user is mentioned. Filters are OR-ed (--channel takes the channel URL
+  name); none means every post; edits and deletes follow their post. Lines
+  keep arrival order. Status lines:
+  {"event":"connected"|"disconnected"|"gap","context","detail"}; a gap means
+  events were lost (no resume, or skipped sequence numbers).
   login makes the context current only if none is current yet, or with --use.
   Bot accounts cannot log in with a password: use --token-stdin with a personal
   access token. A token context never re-logs-in; a rejected token is an error.
