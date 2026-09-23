@@ -24,7 +24,7 @@ Usage:
   mmcli context list | use NAME | current
   mmcli get     <link|post_id> [--thread] [common]
   mmcli thread  <link|post_id> [common]
-  mmcli search  <query...> [--team T] [--channel C] [--from USER] [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--limit N] [--or] [common]
+  mmcli search  <query...> [--team T] [--channel C] [--from USER] [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--limit N | --all] [--or] [common]
   mmcli reply   <link|post_id> <message...> [common]
   mmcli post    <channel|~channel|@user|link> <message...> [--team T] [common]
   mmcli delete  <link|post_id> [common]
@@ -42,6 +42,9 @@ Notes:
     mmcli reply <id> -- "-- looks off to me".
   - search assembles Mattermost modifiers from flags: --channel→in:, --from→from:,
     --after→after:, --before→before:; mention search is just a "@username" query.
+  - The server returns at most 100 results per search; search re-queries
+    further back in time until done. A cut-off (--limit, default 50, or over
+    100 results on a single day) is reported as a warning on stderr.
 
 login password sources (first non-empty wins):
   --password VALUE (insecure; visible in ps), --password-stdin (first stdin line),

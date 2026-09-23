@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/esivres/mmcli/internal/config"
 	"github.com/esivres/mmcli/internal/link"
@@ -309,14 +310,15 @@ func cmdSearch(d deps, args []string) error {
 	from := fs.String("from", "", "restrict to author (from:)")
 	after := fs.String("after", "", "only posts after date YYYY-MM-DD")
 	before := fs.String("before", "", "only posts before date YYYY-MM-DD")
-	limit := fs.Int("limit", 50, "max results (per_page)")
+	limit := fs.Int("limit", 50, "max results")
+	all := fs.Bool("all", false, "fetch every result, ignoring --limit")
 	orSearch := fs.Bool("or", false, "OR search instead of AND")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 
-	terms := buildTerms(fs.Args(), *channel, *from, *after, *before)
-	if strings.TrimSpace(terms) == "" {
+	terms := buildTerms(fs.Args(), *channel, *from, *after, "")
+	if strings.TrimSpace(terms) == "" && *before == "" {
 		return fmt.Errorf("nothing to search: provide a query and/or filters")
 	}
 
@@ -331,11 +333,68 @@ func cmdSearch(d deps, args []string) error {
 	if err != nil {
 		return err
 	}
-	pl, err := client.Search(ctx, teamID, mm.SearchOpts{Terms: terms, IsOrSearch: *orSearch, PerPage: *limit})
+	maxPosts := *limit
+	if *all {
+		maxPosts = 0
+	}
+	pl, warning, err := searchAll(ctx, client, teamID, terms, *before, *orSearch, maxPosts)
 	if err != nil {
 		return err
 	}
+	if warning != "" {
+		fmt.Fprintln(d.stderr, "warning:", warning)
+	}
 	return output.Emit(d.stdout, output.Posts(pl, namesFor(ctx, client, postsOf(pl)...)), c.pretty)
+}
+
+// searchCap is the server's hard limit of results per search query; it
+// ignores per_page above it and returns nothing for further pages.
+const searchCap = 100
+
+// searchAll works around searchCap by re-querying with before: set just past
+// the oldest result's (UTC) day, deduplicating the overlap. It stops at
+// maxPosts (0 = no cap) and returns a warning when results were cut off.
+func searchAll(ctx context.Context, client *mm.Client, teamID, terms, before string, orSearch bool, maxPosts int) (*mm.PostList, string, error) {
+	merged := &mm.PostList{Posts: map[string]*mm.Post{}}
+	for {
+		q := terms
+		if before != "" {
+			q = strings.TrimSpace(q + " before:" + before)
+		}
+		pl, err := client.Search(ctx, teamID, mm.SearchOpts{Terms: q, IsOrSearch: orSearch, PerPage: searchCap})
+		if err != nil {
+			return nil, "", err
+		}
+		added := 0
+		var oldest int64
+		for _, id := range pl.Order {
+			p := pl.Posts[id]
+			if p == nil {
+				continue
+			}
+			if oldest == 0 || p.CreateAt < oldest {
+				oldest = p.CreateAt
+			}
+			if _, dup := merged.Posts[id]; dup {
+				continue
+			}
+			if maxPosts > 0 && len(merged.Order) == maxPosts {
+				return merged, fmt.Sprintf("stopped at --limit %d, more results exist (raise --limit or use --all)", maxPosts), nil
+			}
+			merged.Order = append(merged.Order, id)
+			merged.Posts[id] = p
+			added++
+		}
+		if len(pl.Order) < searchCap {
+			return merged, "", nil
+		}
+		oldestDay := time.UnixMilli(oldest).UTC().Truncate(24 * time.Hour)
+		next := oldestDay.Add(24 * time.Hour).Format("2006-01-02")
+		if added == 0 || next == before {
+			return merged, fmt.Sprintf("more than %d results on %s, older results skipped (narrow the query)", searchCap, oldestDay.Format("2006-01-02")), nil
+		}
+		before = next
+	}
 }
 
 // buildTerms assembles a Mattermost search string from a free query plus
