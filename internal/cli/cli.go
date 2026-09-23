@@ -44,7 +44,8 @@ Notes:
     --after→after:, --before→before:; mention search is just a "@username" query.
   - The server returns at most 100 results per search; search re-queries
     further back in time until done. A cut-off (--limit, default 50, or over
-    100 results on a single day) is reported as a warning on stderr.
+    100 results on a single UTC day) is reported as a warning on stderr.
+    Dates in --after/--before are UTC days.
 
 login password sources (first non-empty wins):
   --password VALUE (insecure; visible in ps), --password-stdin (first stdin line),

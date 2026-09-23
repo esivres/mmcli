@@ -173,6 +173,8 @@ type SearchOpts struct {
 	IsOrSearch bool   `json:"is_or_search"`
 	Page       int    `json:"page"`
 	PerPage    int    `json:"per_page"`
+	// TimeZoneOffset (seconds) sets the day boundaries of after:/before:.
+	TimeZoneOffset int `json:"time_zone_offset"`
 }
 
 // Search runs a posts search within a team. terms may contain Mattermost

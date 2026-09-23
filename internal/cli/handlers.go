@@ -317,9 +317,16 @@ func cmdSearch(d deps, args []string) error {
 		return err
 	}
 
-	terms := buildTerms(fs.Args(), *channel, *from, *after, "")
-	if strings.TrimSpace(terms) == "" && *before == "" {
+	if strings.TrimSpace(buildTerms(fs.Args(), *channel, *from, *after, *before)) == "" {
 		return fmt.Errorf("nothing to search: provide a query and/or filters")
+	}
+	for _, a := range fs.Args() {
+		if strings.HasPrefix(a, "before:") {
+			return fmt.Errorf("use --before instead of before: in the query")
+		}
+	}
+	if *limit <= 0 && !*all {
+		return fmt.Errorf("--limit must be positive; use --all for no limit")
 	}
 
 	client, _, cc, err := d.buildClient(c.context)
@@ -337,7 +344,10 @@ func cmdSearch(d deps, args []string) error {
 	if *all {
 		maxPosts = 0
 	}
-	pl, warning, err := searchAll(ctx, client, teamID, terms, *before, *orSearch, maxPosts)
+	build := func(before string) string {
+		return buildTerms(fs.Args(), *channel, *from, *after, before)
+	}
+	pl, warning, err := searchAll(ctx, client, teamID, build, *before, *orSearch, maxPosts)
 	if err != nil {
 		return err
 	}
@@ -352,20 +362,17 @@ func cmdSearch(d deps, args []string) error {
 const searchCap = 100
 
 // searchAll works around searchCap by re-querying with before: set just past
-// the oldest result's (UTC) day, deduplicating the overlap. It stops at
-// maxPosts (0 = no cap) and returns a warning when results were cut off.
-func searchAll(ctx context.Context, client *mm.Client, teamID, terms, before string, orSearch bool, maxPosts int) (*mm.PostList, string, error) {
+// the oldest result's UTC day, deduplicating the overlap. terms builds the
+// query for a given before: bound. It stops at maxPosts (0 = no cap) and
+// returns a warning when results were cut off.
+func searchAll(ctx context.Context, client *mm.Client, teamID string, terms func(before string) string, before string, orSearch bool, maxPosts int) (*mm.PostList, string, error) {
 	merged := &mm.PostList{Posts: map[string]*mm.Post{}}
 	for {
-		q := terms
-		if before != "" {
-			q = strings.TrimSpace(q + " before:" + before)
-		}
-		pl, err := client.Search(ctx, teamID, mm.SearchOpts{Terms: q, IsOrSearch: orSearch, PerPage: searchCap})
+		// Offset 0 pins day boundaries to UTC, matching the day arithmetic below.
+		pl, err := client.Search(ctx, teamID, mm.SearchOpts{Terms: terms(before), IsOrSearch: orSearch, PerPage: searchCap, TimeZoneOffset: 0})
 		if err != nil {
 			return nil, "", err
 		}
-		added := 0
 		var oldest int64
 		for _, id := range pl.Order {
 			p := pl.Posts[id]
@@ -383,15 +390,15 @@ func searchAll(ctx context.Context, client *mm.Client, teamID, terms, before str
 			}
 			merged.Order = append(merged.Order, id)
 			merged.Posts[id] = p
-			added++
 		}
 		if len(pl.Order) < searchCap {
 			return merged, "", nil
 		}
 		oldestDay := time.UnixMilli(oldest).UTC().Truncate(24 * time.Hour)
 		next := oldestDay.Add(24 * time.Hour).Format("2006-01-02")
-		if added == 0 || next == before {
-			return merged, fmt.Sprintf("more than %d results on %s, older results skipped (narrow the query)", searchCap, oldestDay.Format("2006-01-02")), nil
+		// The bound must strictly move back in time, or the walk cannot finish.
+		if before != "" && next >= before {
+			return merged, fmt.Sprintf("more than %d results on %s (UTC), results from that day and earlier skipped (narrow the query)", searchCap, oldestDay.Format("2006-01-02")), nil
 		}
 		before = next
 	}
