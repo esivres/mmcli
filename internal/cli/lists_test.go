@@ -33,6 +33,8 @@ func listServer(t *testing.T, threads map[string][]mm.Thread) (*httptest.Server,
 		switch {
 		case p == "/api/v4/users/me":
 			_, _ = w.Write([]byte(`{"id":"me1","username":"me"}`))
+		case p == "/api/v4/teams/name/two":
+			_, _ = w.Write([]byte(`{"id":"t2","name":"two"}`))
 		case p == "/api/v4/users/me/teams":
 			_, _ = w.Write([]byte(`[{"id":"t1","name":"one"},{"id":"t2","name":"two"}]`))
 		case p == "/api/v4/users/ids":
@@ -155,6 +157,22 @@ func TestThreadsPagesAndStops(t *testing.T) {
 	}
 	if len(*queries) != 2 || !strings.Contains((*queries)[0], "since=") {
 		t.Fatalf("--since must narrow the server listing and not page through older threads: %v", *queries)
+	}
+
+	// Team "two" has 3 threads: a limit that fits is silent, one short warns.
+	errOut.Reset()
+	if exact := runJSON[[]RenderedThread](t, d, out, errOut, "threads", "--team", "two", "--limit", "3"); len(exact) != 3 || errOut.Len() != 0 {
+		t.Fatalf("a list that fits --limit is complete and must not warn: %d, %s", len(exact), errOut)
+	}
+	if strings.Contains((*queries)[len(*queries)-1], "unread=") {
+		t.Fatalf("unread must only be asked for with --unread: %v", *queries)
+	}
+	if short := runJSON[[]RenderedThread](t, d, out, errOut, "threads", "--team", "two", "--limit", "2"); len(short) != 2 || !strings.Contains(errOut.String(), "stopped at --limit 2") {
+		t.Fatalf("one thread over --limit must be reported: %d, %s", len(short), errOut)
+	}
+	runJSON[[]RenderedThread](t, d, out, errOut, "threads", "--unread", "--limit", "1")
+	if !strings.Contains((*queries)[len(*queries)-1], "unread=true") {
+		t.Fatalf("--unread must reach the server: %v", *queries)
 	}
 
 	top := runJSON[[]RenderedThread](t, d, out, errOut, "threads", "--limit", "4")

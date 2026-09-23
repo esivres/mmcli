@@ -217,7 +217,8 @@ func cmdThreads(d deps, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := newCtx()
+	// A large account pages ~35 times at ~2 s a page.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	teams, err := listTeams(ctx, client, *team)
@@ -225,10 +226,16 @@ func cmdThreads(d deps, args []string) error {
 		return err
 	}
 	byID := map[string]mm.Thread{}
+	rootless := 0
 	for _, tid := range teams {
-		if err := collectThreads(ctx, client, tid, sinceMs, *unread, maxThreads, byID); err != nil {
+		n, err := collectThreads(ctx, client, tid, sinceMs, *unread, maxThreads, byID)
+		if err != nil {
 			return err
 		}
+		rootless += n
+	}
+	if rootless > 0 {
+		fmt.Fprintf(d.stderr, "warning: %d threads came without a root post and are left out\n", rootless)
 	}
 	threads := make([]mm.Thread, 0, len(byID))
 	for _, t := range byID {
@@ -264,32 +271,38 @@ func cmdThreads(d deps, args []string) error {
 }
 
 // collectThreads pages one team's followed threads into byID, newest reply
-// first. It stops past since, or once one thread more than maxThreads is in
-// hand: enough to tell the caller the list was cut off.
-func collectThreads(ctx context.Context, client *mm.Client, teamID string, since int64, unread bool, maxThreads int, byID map[string]mm.Thread) error {
+// first, and returns how many came without a root post. It stops past since,
+// or once one thread more than maxThreads is in hand: enough to tell the
+// caller the list was cut off.
+func collectThreads(ctx context.Context, client *mm.Client, teamID string, since int64, unread bool, maxThreads int, byID map[string]mm.Thread) (int, error) {
 	before := ""
-	taken := 0
+	taken, rootless := 0, 0
 	for {
 		page, err := client.MyThreads(ctx, teamID, since, before, unread)
 		if err != nil {
-			return err
+			return rootless, err
 		}
 		for _, t := range page.Threads {
 			if t.LastReplyAt < since {
-				return nil
+				return rootless, nil
 			}
 			if t.Post == nil {
+				rootless++
 				continue
 			}
 			byID[t.ID] = t
 			taken++
 			if maxThreads > 0 && taken > maxThreads {
-				return nil
+				return rootless, nil
 			}
 		}
 		if len(page.Threads) < mm.ThreadsPerPage {
-			return nil
+			return rootless, nil
 		}
-		before = page.Threads[len(page.Threads)-1].ID
+		next := page.Threads[len(page.Threads)-1].ID
+		if next == before {
+			return rootless, fmt.Errorf("threads: server did not advance past %s", before)
+		}
+		before = next
 	}
 }
