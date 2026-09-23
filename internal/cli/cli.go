@@ -28,6 +28,7 @@ Usage:
   mmcli reply   <link|post_id> <message...> [common]
   mmcli post    <channel|~channel|@user|link> <message...> [--team T] [common]
   mmcli delete  <link|post_id> [common]
+  mmcli stream  [--context NAME]... [--mention] [--dm] [--channel NAME]... [--merge-window 1.5s]
   mmcli version
 
 Common flags (get/thread/search/reply/post):
@@ -51,6 +52,12 @@ login password sources (first non-empty wins):
   --password VALUE (insecure; visible in ps), --password-stdin (first stdin line),
   $MMCLI_PASSWORD, then a line read from stdin.
   post @user sends a direct message; --team does not apply there.
+  stream prints one JSON line per live event until interrupted. A post seen
+  by several contexts of the same server is merged into one line after
+  --merge-window: "contexts" lists who can see (and reply to) it, "mentions"
+  whose user is mentioned. Filters are OR-ed; none means every post. Status
+  lines: {"event":"connected"|"disconnected"|"gap","context","detail"}; a gap
+  means events were lost.
   login makes the context current only if none is current yet, or with --use.
   Bot accounts cannot log in with a password: use --token-stdin with a personal
   access token. A token context never re-logs-in; a rejected token is an error.
@@ -83,6 +90,7 @@ type deps struct {
 	stdin  io.Reader
 	stdout io.Writer
 	stderr io.Writer
+	ctx    context.Context // stream lifetime; nil means until SIGINT/SIGTERM
 }
 
 // Run dispatches a command. Returns a process exit code.
@@ -116,6 +124,8 @@ func run(d deps, args []string) int {
 		err = cmdPost(d, args[1:])
 	case "delete":
 		err = cmdDelete(d, args[1:])
+	case "stream":
+		err = cmdStream(d, args[1:])
 	case "version", "--version":
 		fmt.Fprintln(d.stdout, Version)
 		return 0
