@@ -354,12 +354,14 @@ func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int
 	// already read is processed before the session ends.
 	events := make(chan *mm.WSEvent, 4096)
 	var readErr error
+	readDone := make(chan struct{})
 	pingErr := make(chan error, 1)
 	var workers sync.WaitGroup
 	defer func() { cancel(); conn.CloseNow(); workers.Wait() }()
 	workers.Add(2)
 	go func() {
 		defer workers.Done()
+		defer close(readDone)
 		defer close(events)
 		for {
 			ev, err := conn.Next(ctx)
@@ -383,11 +385,18 @@ func (s *streamSource) session(ctx context.Context, connID *string, nextSeq *int
 			select {
 			case <-ctx.Done():
 				return
+			case <-readDone:
+				return // the read error is the real cause
 			case <-t.C:
 				pctx, pcancel := context.WithTimeout(ctx, pingTimeout)
 				err := conn.Ping(pctx)
 				pcancel()
 				if err != nil && ctx.Err() == nil {
+					select {
+					case <-readDone:
+						return // the socket was already closed; keep the read error
+					default:
+					}
 					pingErr <- fmt.Errorf("no pong from server: %w", err)
 					conn.CloseNow() // ends the reader, which drains into events
 					return

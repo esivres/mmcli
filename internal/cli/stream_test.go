@@ -570,3 +570,22 @@ func TestStreamFollowsChannelRename(t *testing.T) {
 		t.Fatalf("renamed channel labeled %v", ch)
 	}
 }
+
+// When the server closes the socket, the disconnect must name that, even if
+// a ping fires while buffered posts are still being processed.
+func TestStreamReportsRealCloseCause(t *testing.T) {
+	oldEvery, oldTimeout := pingEvery, pingTimeout
+	pingEvery, pingTimeout = 30*time.Millisecond, time.Second
+	t.Cleanup(func() { pingEvery, pingTimeout = oldEvery, oldTimeout })
+	ws, srv := newWSServer(t)
+	ws.channelDelay = 40 * time.Millisecond
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", events: []map[string]any{
+		postedEvent(1, "p1", "c1"), postedEvent(2, "p2", "c2"), postedEvent(3, "p3", "c3")}}}
+	lines := runStream(t, srv.URL, []string{"bot"}, []string{"--context", "bot"}, func(l []map[string]any) bool {
+		return len(events(l, "disconnected")) > 0
+	})
+	d := events(lines, "disconnected")
+	if len(d) == 0 || strings.Contains(fmt.Sprint(d[0]["detail"]), "no pong") {
+		t.Fatalf("close cause misreported: %v", d)
+	}
+}
