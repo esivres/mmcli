@@ -56,5 +56,5 @@ func (SystemStore) Delete(key string) error {
 // PasswordKey is the keyring key holding a context's login password.
 func PasswordKey(ctx string) string { return "password:" + ctx }
 
-// TokenKey is the keyring key holding a context's cached session token.
+// TokenKey is the keyring key holding a context's session token or personal access token.
 func TokenKey(ctx string) string { return "token:" + ctx }

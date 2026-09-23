@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/esivres/mmcli/internal/config"
 	"github.com/esivres/mmcli/internal/secrets"
 )
 
@@ -61,7 +63,7 @@ func TestTokenLoginThenRead(t *testing.T) {
 	srv := fakeServer(t, &logins)
 	store := secrets.NewMemory()
 	_ = store.Set(secrets.PasswordKey("bot"), "stale")
-	d, out, errOut := newDeps(t, store, botToken+"\n")
+	d, out, errOut := newDeps(t, store, "  "+botToken+" \r\n")
 
 	if code := run(d, []string{"login", "--context", "bot", "--url", srv.URL, "--token-stdin"}); code != 0 {
 		t.Fatalf("login exit %d: %s", code, errOut)
@@ -123,5 +125,68 @@ func TestTokenLoginRejectedSavesNothing(t *testing.T) {
 	errOut.Reset()
 	if code := run(d, []string{"get", postID, "--context", "bot"}); code != 1 || !strings.Contains(errOut.String(), "not found") {
 		t.Fatalf("context must not exist after rejected login: exit %d, %s", code, errOut)
+	}
+}
+
+// Password contexts must keep re-logging-in once on an expired session token.
+func TestPasswordContextRelogsInOnce(t *testing.T) {
+	var logins atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4/users/login":
+			logins.Add(1)
+			w.Header().Set("Token", "fresh")
+			_, _ = w.Write([]byte(`{"id":"u2","username":"me"}`))
+		case r.Header.Get("Authorization") != "Bearer fresh":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"status_code":401,"message":"Invalid or expired session"}`))
+		case r.URL.Path == "/api/v4/posts/"+postID:
+			_, _ = w.Write([]byte(`{"id":"` + postID + `","user_id":"u2","channel_id":"c1","message":"hi"}`))
+		case r.URL.Path == "/api/v4/users/ids":
+			_, _ = w.Write([]byte(`[{"id":"u2","username":"me"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	store := secrets.NewMemory()
+	d, _, errOut := newDeps(t, store, "pw\n")
+	if code := run(d, []string{"login", "--context", "work", "--url", srv.URL, "--login-id", "me", "--password-stdin"}); code != 0 {
+		t.Fatalf("login exit %d: %s", code, errOut)
+	}
+	_ = store.Set(secrets.TokenKey("work"), "expired")
+	logins.Store(0)
+
+	if code := run(d, []string{"get", postID, "--context", "work"}); code != 0 {
+		t.Fatalf("get exit %d: %s", code, errOut)
+	}
+	if n := logins.Load(); n != 1 {
+		t.Fatalf("want exactly one re-login, got %d", n)
+	}
+	if tok, _ := store.Get(secrets.TokenKey("work")); tok != "fresh" {
+		t.Fatalf("fresh session token not cached, got %q", tok)
+	}
+}
+
+// A failed config write must not strip the password from an existing context.
+func TestTokenLoginKeepsPasswordWhenSaveFails(t *testing.T) {
+	var logins atomic.Int32
+	srv := fakeServer(t, &logins)
+	store := secrets.NewMemory()
+	_ = store.Set(secrets.PasswordKey("work"), "pw")
+	d, _, _ := newDeps(t, store, botToken+"\n")
+	path, err := config.DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil { // a directory in place of the file makes Save fail
+		t.Fatal(err)
+	}
+
+	if code := run(d, []string{"login", "--context", "work", "--url", srv.URL, "--token-stdin"}); code != 1 {
+		t.Fatalf("want exit 1 when config cannot be written, got %d", code)
+	}
+	if pw, _ := store.Get(secrets.PasswordKey("work")); pw != "pw" {
+		t.Fatal("password was removed although the token context was not saved")
 	}
 }

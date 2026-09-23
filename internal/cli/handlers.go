@@ -90,6 +90,9 @@ func loginWithToken(d deps, name, url, team string, pretty bool) error {
 	}
 	sc := bufio.NewScanner(d.stdin)
 	if !sc.Scan() {
+		if err := sc.Err(); err != nil {
+			return err
+		}
 		return fmt.Errorf("no token on stdin")
 	}
 	tok := strings.TrimSpace(sc.Text())
@@ -101,15 +104,11 @@ func loginWithToken(d deps, name, url, team string, pretty bool) error {
 	defer cancel()
 	me, err := mm.New(url, tok, "", "").Me(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("validate token: %w", err)
 	}
 
 	if err := d.store.Set(secrets.TokenKey(name), tok); err != nil {
 		return fmt.Errorf("store token: %w", err)
-	}
-	// A leftover password would never be used again for this context.
-	if err := d.store.Delete(secrets.PasswordKey(name)); err != nil {
-		return err
 	}
 
 	path, err := config.DefaultPath()
@@ -122,6 +121,10 @@ func loginWithToken(d deps, name, url, team string, pretty bool) error {
 	}
 	cfg.Set(name, config.Context{URL: strings.TrimRight(url, "/"), LoginID: me.Username, DefaultTeam: team, Auth: config.AuthToken})
 	if err := cfg.Save(); err != nil {
+		return err
+	}
+	// Only after Save: a password context must stay usable if Save fails.
+	if err := d.store.Delete(secrets.PasswordKey(name)); err != nil {
 		return err
 	}
 

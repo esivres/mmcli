@@ -123,7 +123,7 @@ func (c *Client) doWithRetry(ctx context.Context, method, path string, in, out a
 		return c.doWithRetry(ctx, method, path, in, out, false)
 	}
 	if resp.StatusCode == http.StatusUnauthorized && c.loginID == "" {
-		return fmt.Errorf("access token rejected (expired or revoked), log in again: %w", decodeAPIError(resp))
+		return fmt.Errorf("access token rejected (invalid, expired or revoked): %w", decodeAPIError(resp))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return decodeAPIError(resp)
