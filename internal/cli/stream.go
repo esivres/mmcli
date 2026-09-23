@@ -62,6 +62,9 @@ type sighting struct {
 	mentioned bool
 	event     streamEvent
 	status    bool
+	// fatal ends the source; neverConnected makes it end the whole stream.
+	fatal          error
+	neverConnected bool
 }
 
 type streamFilter struct {
@@ -134,7 +137,7 @@ func cmdStream(d deps, args []string) error {
 			src.run(ctx, sightings)
 		}()
 	}
-	err := mergeStream(ctx, d, order, *window, sightings)
+	err := mergeStream(ctx, d, order, *window, sightings, len(sources))
 	cancel()
 	wg.Wait()
 	return err
@@ -143,7 +146,7 @@ func cmdStream(d deps, args []string) error {
 // mergeStream holds every line for window, collecting the contexts that saw a
 // post, then emits in arrival order. Status lines share the queue so they
 // never overtake posts received before them. It is the only stdout writer.
-func mergeStream(ctx context.Context, d deps, order []string, window time.Duration, sightings <-chan sighting) error {
+func mergeStream(ctx context.Context, d deps, order []string, window time.Duration, sightings <-chan sighting, alive int) error {
 	type pending struct {
 		first  time.Time
 		status *streamEvent
@@ -223,6 +226,20 @@ func mergeStream(ctx context.Context, d deps, order []string, window time.Durati
 			return flush(time.Now(), true)
 		case s := <-sightings:
 			now := time.Now()
+			if s.fatal != nil {
+				if s.neverConnected {
+					_ = flush(now, true)
+					return fmt.Errorf("context %q: %w", s.context, s.fatal)
+				}
+				queue = append(queue, &pending{first: now, status: &streamEvent{Event: "failed", Context: s.context, Detail: s.fatal.Error()}})
+				if alive--; alive == 0 {
+					if err := flush(now, true); err != nil {
+						return err
+					}
+					return fmt.Errorf("all contexts failed; last: %q: %w", s.context, s.fatal)
+				}
+				continue
+			}
 			if s.status {
 				ev := s.event
 				queue = append(queue, &pending{first: now, status: &ev})
@@ -272,9 +289,17 @@ func (s *streamSource) run(ctx context.Context, sightings chan<- sighting) {
 	var connID string
 	var nextSeq int64
 	delay := reconnectMin
+	everConnected := false
 	for ctx.Err() == nil {
-		err := s.session(ctx, &connID, &nextSeq, sightings, func() { delay = reconnectMin })
+		err := s.session(ctx, &connID, &nextSeq, sightings, func() { delay = reconnectMin; everConnected = true })
 		if ctx.Err() != nil {
+			return
+		}
+		if mm.IsUnauthorized(err) {
+			select {
+			case sightings <- sighting{context: s.name, fatal: err, neverConnected: !everConnected}:
+			case <-ctx.Done():
+			}
 			return
 		}
 		s.status(ctx, sightings, "disconnected", err.Error())

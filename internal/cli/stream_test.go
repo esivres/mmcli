@@ -27,6 +27,7 @@ type wsScript struct {
 	events   []map[string]any
 	hold     bool
 	deaf     bool // never reads, so pings go unanswered
+	revoke   bool // the token stops working once this connection closes
 }
 
 type wsServer struct {
@@ -48,7 +49,9 @@ func newWSServer(t *testing.T) (*wsServer, *httptest.Server) {
 
 func (ws *wsServer) handle(w http.ResponseWriter, r *http.Request) {
 	tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	ws.mu.Lock()
 	uid, ok := ws.users[tok]
+	ws.mu.Unlock()
 	if !ok {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
@@ -94,6 +97,11 @@ func (ws *wsServer) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		if sc.hold {
 			<-ctx.Done()
+		}
+		if sc.revoke {
+			ws.mu.Lock()
+			delete(ws.users, tok)
+			ws.mu.Unlock()
 		}
 		_ = c.Close(websocket.StatusGoingAway, "")
 	default:
@@ -145,6 +153,17 @@ func (s *syncBuffer) lines() []map[string]any {
 // the deadline passes, and returns the emitted lines.
 func runStream(t *testing.T, srvURL string, ctxs []string, args []string, until func([]map[string]any) bool) []map[string]any {
 	t.Helper()
+	lines, code, stderr := runStreamExit(t, srvURL, ctxs, args, until, nil)
+	if code != 0 {
+		t.Fatalf("stream exit %d: %s", code, stderr)
+	}
+	return lines
+}
+
+// runStreamExit is runStream that also reports the exit code and stderr;
+// beforeStream runs after login.
+func runStreamExit(t *testing.T, srvURL string, ctxs []string, args []string, until func([]map[string]any) bool, beforeStream func()) ([]map[string]any, int, string) {
+	t.Helper()
 	oldMin, oldFlush := reconnectMin, flushEvery
 	reconnectMin, flushEvery = 10*time.Millisecond, 10*time.Millisecond
 	t.Cleanup(func() { reconnectMin, flushEvery = oldMin, oldFlush })
@@ -156,6 +175,9 @@ func runStream(t *testing.T, srvURL string, ctxs []string, args []string, until 
 			t.Fatalf("login %s exit %d: %s", name, code, errOut)
 		}
 	}
+	if beforeStream != nil {
+		beforeStream()
+	}
 	out := &syncBuffer{}
 	d.stdout = out
 	ctx, cancel := context.WithCancel(context.Background())
@@ -163,14 +185,18 @@ func runStream(t *testing.T, srvURL string, ctxs []string, args []string, until 
 	done := make(chan int)
 	go func() { done <- run(d, append([]string{"stream", "--merge-window", "150ms"}, args...)) }()
 	deadline := time.Now().Add(5 * time.Second)
-	for !until(out.lines()) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	code := -1
+	for code == -1 && !until(out.lines()) && time.Now().Before(deadline) {
+		select {
+		case code = <-done:
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	cancel()
-	if code := <-done; code != 0 {
-		t.Fatalf("stream exit %d: %s", code, errOut)
+	if code == -1 {
+		code = <-done
 	}
-	return out.lines()
+	return out.lines(), code, errOut.String()
 }
 
 func posts(lines []map[string]any) map[string]map[string]any {
@@ -398,5 +424,41 @@ func TestStreamEditFollowsMentionedPost(t *testing.T) {
 	})
 	if got, want := sequence(lines), "connected posted:p1 post_edited:p1"; got != want {
 		t.Fatalf("lines\n got %s\nwant %s", got, want)
+	}
+}
+
+func never([]map[string]any) bool { return false }
+
+// A context rejected before it ever connected is a setup error: stop at once.
+func TestStreamFailsFastOnRejectedToken(t *testing.T) {
+	ws, srv := newWSServer(t)
+	revoke := func() { ws.mu.Lock(); delete(ws.users, "bot-tok"); ws.mu.Unlock() }
+	_, code, stderr := runStreamExit(t, srv.URL, []string{"work", "bot"}, []string{"--context", "work", "--context", "bot"}, never, revoke)
+	if code != 1 || !strings.Contains(stderr, `context "bot"`) {
+		t.Fatalf("want exit 1 naming bot, got %d: %s", code, stderr)
+	}
+}
+
+// Losing one of several contexts is reported and the rest keep streaming;
+// losing the last one ends the process with an error.
+func TestStreamReportsFailedContext(t *testing.T) {
+	ws, srv := newWSServer(t)
+	ws.scripts["bot-tok"] = []wsScript{{helloID: "b", revoke: true}}
+	ws.scripts["work-tok"] = []wsScript{{helloID: "w", hold: true, delay: 600 * time.Millisecond,
+		events: []map[string]any{postedEvent(1, "p1", "c1")}}}
+	lines, code, stderr := runStreamExit(t, srv.URL, []string{"work", "bot"}, []string{"--context", "work", "--context", "bot"},
+		func(l []map[string]any) bool { return len(posts(l)) == 1 }, nil)
+	if code != 0 {
+		t.Fatalf("stream with a live context exited %d: %s", code, stderr)
+	}
+	if f := events(lines, "failed"); len(f) != 1 || f[0]["context"] != "bot" {
+		t.Fatalf("want one failed line for bot: %s", sequence(lines))
+	}
+
+	ws2, srv2 := newWSServer(t)
+	ws2.scripts["bot-tok"] = []wsScript{{helloID: "b", revoke: true}}
+	lines, code, _ = runStreamExit(t, srv2.URL, []string{"bot"}, []string{"--context", "bot"}, never, nil)
+	if code != 1 || len(events(lines, "failed")) != 1 {
+		t.Fatalf("last context lost: want exit 1 after a failed line, got %d: %s", code, sequence(lines))
 	}
 }

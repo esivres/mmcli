@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -137,6 +138,12 @@ func (c *Client) doWithRetry(ctx context.Context, method, path string, in, out a
 	return nil
 }
 
+// IsUnauthorized reports a rejected token or failed login: retrying will not help.
+func IsUnauthorized(err error) bool {
+	var e *apiError
+	return errors.As(err, &e) && e.StatusCode == http.StatusUnauthorized
+}
+
 func decodeAPIError(resp *http.Response) error {
 	data, _ := io.ReadAll(resp.Body)
 	var e apiError
@@ -146,7 +153,7 @@ func decodeAPIError(resp *http.Response) error {
 		}
 		return &e
 	}
-	return fmt.Errorf("mattermost API %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	return &apiError{StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(data))}
 }
 
 // GetPost fetches a single post by ID.

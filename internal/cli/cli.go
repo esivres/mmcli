@@ -59,7 +59,10 @@ login password sources (first non-empty wins):
   name); none means every post; edits and deletes follow their post. Lines
   keep arrival order. Status lines:
   {"event":"connected"|"disconnected"|"gap","context","detail"}; a gap means
-  events were lost (no resume, or skipped sequence numbers).
+  events were lost (no resume, or skipped sequence numbers). A rejected token
+  or login is final: before the first connection stream exits with an error;
+  later it prints {"event":"failed",...} and exits non-zero once no context
+  is left.
   login makes the context current only if none is current yet, or with --use.
   Bot accounts cannot log in with a password: use --token-stdin with a personal
   access token. A token context never re-logs-in; a rejected token is an error.
