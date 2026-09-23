@@ -186,3 +186,59 @@ func TestFileSearch(t *testing.T) {
 		t.Fatalf("hits %+v", hits)
 	}
 }
+
+// Names come from the uploader; none may point outside the target dir.
+func TestSafeFileName(t *testing.T) {
+	for name, want := range map[string]string{
+		"report.pdf": "report.pdf", "../../.ssh/authorized_keys": "authorized_keys",
+		`..\..\evil.bat`: "evil.bat", "..": "fid", ".": "fid", "": "fid", "/": "fid",
+	} {
+		if got := safeFileName(name, "fid"); got != want {
+			t.Errorf("safeFileName(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// --out points at a real directory: an uploaded ".bashrc" must not replace
+// the user's file, and a second file of the same name must not replace the first.
+func TestFileGetNeverReplacesInOut(t *testing.T) {
+	srv := fileServer(t, map[string][2]string{"f1": {".bashrc", "text/plain"}}, map[string][]byte{"f1": []byte("rm -rf ~")})
+	d, _, errOut := loggedIn(t, srv.URL)
+	dir := t.TempDir()
+	existing := filepath.Join(dir, ".bashrc")
+	if err := os.WriteFile(existing, []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := run(d, []string{"file", "get", "f1", "--out", dir}); code != 1 || !strings.Contains(errOut.String(), "not replacing") {
+		t.Fatalf("want refusal, got exit %d: %s", code, errOut)
+	}
+	if b, _ := os.ReadFile(existing); string(b) != "mine" {
+		t.Fatalf("existing file replaced: %q", b)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("temp file left behind: %v", entries)
+	}
+}
+
+// Files over the extraction limit are refused before any download.
+func TestFileTextRefusesHugeFileUpFront(t *testing.T) {
+	var downloads int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4/users/me":
+			_, _ = w.Write([]byte(`{"id":"bot1","username":"digest-bot"}`))
+		case strings.HasSuffix(r.URL.Path, "/info"):
+			_, _ = w.Write([]byte(`{"id":"f1","name":"huge.log","mime_type":"text/plain","size":9000000000}`))
+		default:
+			downloads++
+		}
+	}))
+	t.Cleanup(srv.Close)
+	d, _, errOut := loggedIn(t, srv.URL)
+	if code := run(d, []string{"file", "text", "f1", "--out", t.TempDir()}); code != 1 || !strings.Contains(errOut.String(), "use `mmcli file get`") {
+		t.Fatalf("want up-front refusal, got exit %d: %s", code, errOut)
+	}
+	if downloads != 0 {
+		t.Fatalf("downloaded %d times before refusing", downloads)
+	}
+}

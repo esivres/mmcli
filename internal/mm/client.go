@@ -146,7 +146,7 @@ func IsUnauthorized(err error) bool {
 }
 
 func decodeAPIError(resp *http.Response) error {
-	data, _ := io.ReadAll(resp.Body)
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	var e apiError
 	if json.Unmarshal(data, &e) == nil && e.Message != "" {
 		if e.StatusCode == 0 {
@@ -259,6 +259,9 @@ func (c *Client) DownloadFile(ctx context.Context, id string, w io.Writer) error
 			continue
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized && c.loginID == "" {
+			return fmt.Errorf("access token rejected (invalid, expired or revoked): %w", decodeAPIError(resp))
+		}
 		if resp.StatusCode != http.StatusOK {
 			return decodeAPIError(resp)
 		}

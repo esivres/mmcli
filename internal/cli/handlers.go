@@ -363,11 +363,11 @@ const searchCap = 100
 
 // searchAll runs a post search past searchCap; see walkBack.
 func searchAll(ctx context.Context, client *mm.Client, teamID string, terms func(before string) string, before string, orSearch bool, maxPosts int) (*mm.PostList, string, error) {
-	posts, warning, err := walkBack(before, maxPosts, func(before string) ([]*mm.Post, error) {
+	posts, warning, err := walkBack(before, maxPosts, func(before string) ([]*mm.Post, int, error) {
 		// Offset 0 pins day boundaries to UTC, matching walkBack's day arithmetic.
 		pl, err := client.Search(ctx, teamID, mm.SearchOpts{Terms: terms(before), IsOrSearch: orSearch, PerPage: searchCap, TimeZoneOffset: 0})
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		var page []*mm.Post
 		for _, id := range pl.Order {
@@ -375,7 +375,7 @@ func searchAll(ctx context.Context, client *mm.Client, teamID string, terms func
 				page = append(page, p)
 			}
 		}
-		return page, nil
+		return page, len(pl.Order), nil
 	}, func(p *mm.Post) (string, int64) { return p.ID, p.CreateAt })
 	if err != nil {
 		return nil, "", err
@@ -391,11 +391,12 @@ func searchAll(ctx context.Context, client *mm.Client, teamID string, terms func
 // walkBack works around searchCap by re-querying with before: set just past
 // the oldest result's UTC day, deduplicating the overlap. It stops at
 // maxItems (0 = no cap) and returns a warning when results were cut off.
-func walkBack[T any](before string, maxItems int, fetch func(before string) ([]T, error), key func(T) (string, int64)) ([]T, string, error) {
+func walkBack[T any](before string, maxItems int, fetch func(before string) ([]T, int, error), key func(T) (string, int64)) ([]T, string, error) {
 	var out []T
 	seen := map[string]bool{}
 	for {
-		page, err := fetch(before)
+		// raw is the server's result count; it decides whether the cap was hit.
+		page, raw, err := fetch(before)
 		if err != nil {
 			return nil, "", err
 		}
@@ -414,7 +415,7 @@ func walkBack[T any](before string, maxItems int, fetch func(before string) ([]T
 			seen[id] = true
 			out = append(out, item)
 		}
-		if len(page) < searchCap {
+		if raw < searchCap {
 			return out, "", nil
 		}
 		oldestDay := time.UnixMilli(oldest).UTC().Truncate(24 * time.Hour)

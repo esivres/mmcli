@@ -102,10 +102,10 @@ func cmdFileSearch(d deps, args []string) error {
 		return err
 	}
 
-	files, warning, err := walkBack(*before, maxFiles, func(before string) ([]*mm.FileInfo, error) {
+	files, warning, err := walkBack(*before, maxFiles, func(before string) ([]*mm.FileInfo, int, error) {
 		fl, err := client.SearchFiles(ctx, teamID, mm.SearchOpts{Terms: buildTerms(query, *channel, *from, *after, before), PerPage: searchCap, TimeZoneOffset: 0})
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		var page []*mm.FileInfo
 		for _, id := range fl.Order {
@@ -113,7 +113,7 @@ func cmdFileSearch(d deps, args []string) error {
 				page = append(page, f)
 			}
 		}
-		return page, nil
+		return page, len(fl.Order), nil
 	}, func(f *mm.FileInfo) (string, int64) { return f.ID, f.CreateAt })
 	if err != nil {
 		return err
@@ -153,13 +153,19 @@ func cmdFileGet(d deps, args []string, text bool) error {
 	fs.SetOutput(d.stderr)
 	var c common
 	addCommon(fs, &c)
-	outDir := fs.String("out", "", "directory to save into (default: user cache dir)")
-	maxChars := fs.Int("max-chars", extract.DefaultLimits.MaxText, "text kept; the middle of longer text is cut")
+	outDir := fs.String("out", "", "directory to save into; existing files are never replaced (default: user cache dir)")
+	var maxBytes *int
+	if text {
+		maxBytes = fs.Int("max-bytes", extract.DefaultLimits.MaxText, "bytes of text kept; the middle of longer text is cut")
+	}
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: mmcli %s <file_id>", name)
+	}
+	if text && *maxBytes <= 0 {
+		return fmt.Errorf("--max-bytes must be positive")
 	}
 	id := fs.Arg(0)
 
@@ -174,6 +180,10 @@ func cmdFileGet(d deps, args []string, text bool) error {
 	if err != nil {
 		return err
 	}
+	if text && info.Size > extract.DefaultLimits.MaxFileBytes {
+		return fmt.Errorf("%s is %d bytes, over the %d-byte text extraction limit; use `mmcli file get`", info.Name, info.Size, extract.DefaultLimits.MaxFileBytes)
+	}
+	replace := *outDir == "" // the per-file cache dir holds only this file
 	dir := *outDir
 	if dir == "" {
 		cache, err := os.UserCacheDir()
@@ -186,15 +196,15 @@ func cmdFileGet(d deps, args []string, text bool) error {
 		return err
 	}
 	dest := filepath.Join(dir, safeFileName(info.Name, info.ID))
-	if err := download(ctx, client, info.ID, dest); err != nil {
+	if err := download(ctx, client, info.ID, dest, replace); err != nil {
 		return err
 	}
 
 	res := fileResult{ID: info.ID, Name: info.Name, Mime: info.MimeType, Size: info.Size, Path: dest}
 	if text {
 		lim := extract.DefaultLimits
-		lim.MaxText = *maxChars
-		r, err := extract.File(dest, info.Name, info.MimeType, lim)
+		lim.MaxText = *maxBytes
+		r, err := extract.File(ctx, dest, info.Name, info.MimeType, lim)
 		if errors.Is(err, extract.ErrImage) {
 			return fmt.Errorf("%w: saved to %s", err, dest)
 		}
@@ -207,8 +217,9 @@ func cmdFileGet(d deps, args []string, text bool) error {
 }
 
 // download writes via a temp file so a failed transfer never leaves a
-// truncated file that looks complete.
-func download(ctx context.Context, client *mm.Client, id, dest string) error {
+// truncated file that looks complete. Without replace an existing file is an
+// error: the name comes from the uploader and may be ".bashrc".
+func download(ctx context.Context, client *mm.Client, id, dest string, replace bool) error {
 	tmp, err := os.CreateTemp(filepath.Dir(dest), ".download-*")
 	if err != nil {
 		return err
@@ -221,7 +232,16 @@ func download(ctx context.Context, client *mm.Client, id, dest string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), dest)
+	if replace {
+		return os.Rename(tmp.Name(), dest)
+	}
+	if err := os.Link(tmp.Name(), dest); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%s already exists; not replacing it", dest)
+		}
+		return err
+	}
+	return nil
 }
 
 // safeFileName keeps only the base name so a crafted name cannot escape dir.
