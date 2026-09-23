@@ -10,7 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -197,14 +200,17 @@ func (c *Client) Search(ctx context.Context, teamID string, opts SearchOpts) (*P
 }
 
 // CreatePost posts a message to a channel. rootID, if non-empty, makes it a
-// threaded reply.
-func (c *Client) CreatePost(ctx context.Context, channelID, message, rootID string) (*Post, error) {
-	body := map[string]string{
+// threaded reply; fileIDs attach previously uploaded files.
+func (c *Client) CreatePost(ctx context.Context, channelID, message, rootID string, fileIDs []string) (*Post, error) {
+	body := map[string]any{
 		"channel_id": channelID,
 		"message":    message,
 	}
 	if rootID != "" {
 		body["root_id"] = rootID
+	}
+	if len(fileIDs) > 0 {
+		body["file_ids"] = fileIDs
 	}
 	var p Post
 	if err := c.do(ctx, http.MethodPost, "/api/v4/posts", body, &p); err != nil {
@@ -270,6 +276,81 @@ func (c *Client) DownloadFile(ctx context.Context, id string, w io.Writer) error
 		}
 		return nil
 	}
+}
+
+// UploadFile uploads a local file into a channel and returns its info; the
+// file is attached once a post references its ID.
+func (c *Client) UploadFile(ctx context.Context, channelID, path string) (*FileInfo, error) {
+	for retry := true; ; retry = false {
+		resp, err := c.upload(ctx, channelID, path)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusUnauthorized && retry && c.loginID != "" {
+			resp.Body.Close()
+			if err := c.Login(ctx); err != nil {
+				return nil, fmt.Errorf("re-login after 401: %w", err)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized && c.loginID == "" {
+			return nil, fmt.Errorf("access token rejected (invalid, expired or revoked): %w", decodeAPIError(resp))
+		}
+		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("upload %s: %w", filepath.Base(path), decodeAPIError(resp))
+		}
+		var out struct {
+			FileInfos []FileInfo `json:"file_infos"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return nil, fmt.Errorf("decode upload response: %w", err)
+		}
+		if len(out.FileInfos) != 1 {
+			return nil, fmt.Errorf("upload %s: server returned %d file infos", filepath.Base(path), len(out.FileInfos))
+		}
+		return &out.FileInfos[0], nil
+	}
+}
+
+// upload streams path as multipart form data, so large files are not held
+// in memory.
+func (c *Client) upload(ctx context.Context, channelID, path string) (*http.Response, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		defer f.Close()
+		err := mw.WriteField("channel_id", channelID)
+		if err == nil {
+			var part io.Writer
+			part, err = mw.CreateFormFile("files", filepath.Base(path))
+			if err == nil {
+				_, err = io.Copy(part, f)
+			}
+		}
+		if err == nil {
+			err = mw.Close()
+		}
+		pw.CloseWithError(err)
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v4/files", pr)
+	if err != nil {
+		pr.Close()
+		return nil, err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upload %s: %w", filepath.Base(path), err)
+	}
+	return resp, nil
 }
 
 // GetTeamByName resolves a team by its URL name.

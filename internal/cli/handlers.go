@@ -454,11 +454,16 @@ func cmdReply(d deps, args []string) error {
 	fs.SetOutput(d.stderr)
 	var c common
 	addCommon(fs, &c)
+	var files multiFlag
+	fs.Var(&files, "file", "attach a local file (repeatable, up to 10)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	if fs.NArg() < 2 {
-		return fmt.Errorf("usage: mmcli reply <link|post_id> <message...>")
+	if fs.NArg() < 1 || (fs.NArg() < 2 && len(files) == 0) {
+		return fmt.Errorf("usage: mmcli reply <link|post_id> <message...> [--file PATH]...")
+	}
+	if err := checkAttachments(files); err != nil {
+		return err
 	}
 	ref, err := link.Parse(fs.Arg(0))
 	if err != nil {
@@ -468,7 +473,7 @@ func cmdReply(d deps, args []string) error {
 		return fmt.Errorf("reply needs a post link or post id")
 	}
 	message := joinMessage(fs.Args()[1:])
-	if message == "" {
+	if message == "" && len(files) == 0 {
 		return fmt.Errorf("empty message")
 	}
 
@@ -488,7 +493,11 @@ func cmdReply(d deps, args []string) error {
 	if root == "" {
 		root = target.ID
 	}
-	created, err := client.CreatePost(ctx, target.ChannelID, message, root)
+	fileIDs, err := uploadAll(ctx, client, target.ChannelID, files)
+	if err != nil {
+		return err
+	}
+	created, err := client.CreatePost(ctx, target.ChannelID, message, root, fileIDs)
 	if err != nil {
 		return err
 	}
@@ -534,14 +543,19 @@ func cmdPost(d deps, args []string) error {
 	var c common
 	addCommon(fs, &c)
 	team := fs.String("team", "", "team URL name (default: context default team)")
+	var files multiFlag
+	fs.Var(&files, "file", "attach a local file (repeatable, up to 10)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	if fs.NArg() < 2 {
-		return fmt.Errorf("usage: mmcli post <channel|~channel|@user|link> <message...>")
+	if fs.NArg() < 1 || (fs.NArg() < 2 && len(files) == 0) {
+		return fmt.Errorf("usage: mmcli post <channel|~channel|@user|link> <message...> [--file PATH]...")
+	}
+	if err := checkAttachments(files); err != nil {
+		return err
 	}
 	message := joinMessage(fs.Args()[1:])
-	if message == "" {
+	if message == "" && len(files) == 0 {
 		return fmt.Errorf("empty message")
 	}
 
@@ -564,7 +578,11 @@ func cmdPost(d deps, args []string) error {
 	if err != nil {
 		return err
 	}
-	created, err := client.CreatePost(ctx, channelID, message, "")
+	fileIDs, err := uploadAll(ctx, client, channelID, files)
+	if err != nil {
+		return err
+	}
+	created, err := client.CreatePost(ctx, channelID, message, "", fileIDs)
 	if err != nil {
 		return err
 	}
@@ -611,4 +629,37 @@ func teamChannelID(ctx context.Context, client *mm.Client, cc config.Context, te
 		return "", fmt.Errorf("resolve channel %q: %w", channelName, err)
 	}
 	return ch.ID, nil
+}
+
+// maxAttachments is the server's limit of files per post.
+const maxAttachments = 10
+
+// checkAttachments validates local files before anything is uploaded, so a
+// typo never leaves a half-sent post.
+func checkAttachments(paths []string) error {
+	if len(paths) > maxAttachments {
+		return fmt.Errorf("at most %d files per post, got %d", maxAttachments, len(paths))
+	}
+	for _, p := range paths {
+		st, err := os.Stat(p)
+		if err != nil {
+			return err
+		}
+		if !st.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", p)
+		}
+	}
+	return nil
+}
+
+func uploadAll(ctx context.Context, client *mm.Client, channelID string, paths []string) ([]string, error) {
+	var ids []string
+	for _, p := range paths {
+		fi, err := client.UploadFile(ctx, channelID, p)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, fi.ID)
+	}
+	return ids, nil
 }

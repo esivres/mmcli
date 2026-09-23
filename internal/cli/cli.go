@@ -25,8 +25,8 @@ Usage:
   mmcli get     <link|post_id> [--thread] [common]
   mmcli thread  <link|post_id> [common]
   mmcli search  <query...> [--team T] [--channel C] [--from USER] [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--limit N | --all] [--or] [common]
-  mmcli reply   <link|post_id> <message...> [common]
-  mmcli post    <channel|~channel|@user|link> <message...> [--team T] [common]
+  mmcli reply   <link|post_id> [message...] [--file PATH]... [common]
+  mmcli post    <channel|~channel|@user|link> [message...] [--file PATH]... [--team T] [common]
   mmcli delete  <link|post_id> [common]
   mmcli stream  [--context NAME]... [--mention] [--dm] [--channel NAME]... [--merge-window 1.5s]
   mmcli file search <query...> [--ext EXT] [--channel C] [--from USER] [--after D] [--before D] [--limit N | --all] [common]
@@ -54,7 +54,9 @@ Notes:
 login password sources (first non-empty wins):
   --password VALUE (insecure; visible in ps), --password-stdin (first stdin line),
   $MMCLI_PASSWORD, then a line read from stdin.
-  post @user sends a direct message; --team does not apply there.
+  post @user sends a direct message; --team does not apply there. --file
+  attaches up to 10 local files (checked before any upload); the message may
+  then be empty.
   stream prints one JSON line per live event until interrupted. A post seen
   by several contexts of the same server is merged into one line after
   --merge-window: "contexts" lists who can see (and reply to) it, "mentions"

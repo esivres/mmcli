@@ -106,6 +106,7 @@ mmcli search "релиз" --channel ops --from alice \
 mmcli reply <permalink|post_id> "текст ответа"   # тред: отвечает в корень нити
 mmcli post  <channel|~channel|channel_link> "текст"  # новое сообщение в канал
 mmcli post  @username "текст"                   # личное сообщение (team не нужна)
+mmcli post  @username "сводка" --file digest.md  # с вложением (--file до 10 раз)
 ```
 
 ## Вложения
