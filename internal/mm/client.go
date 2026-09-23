@@ -16,7 +16,8 @@ import (
 // Client talks to one Mattermost server. It is stateless across processes:
 // a session token is cached by the caller (in the keyring) and passed back in.
 // On a 401 the client re-logs-in once using loginID/password, then retries,
-// and reports the fresh token via OnToken.
+// and reports the fresh token via OnToken. With an empty loginID (access token
+// auth) there is nothing to re-log-in with, so a 401 is returned as is.
 type Client struct {
 	baseURL  string
 	http     *http.Client
@@ -121,6 +122,9 @@ func (c *Client) doWithRetry(ctx context.Context, method, path string, in, out a
 		}
 		return c.doWithRetry(ctx, method, path, in, out, false)
 	}
+	if resp.StatusCode == http.StatusUnauthorized && c.loginID == "" {
+		return fmt.Errorf("access token rejected (expired or revoked), log in again: %w", decodeAPIError(resp))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return decodeAPIError(resp)
 	}
@@ -221,6 +225,15 @@ func (c *Client) GetChannelByName(ctx context.Context, teamID, name string) (*Ch
 		return nil, err
 	}
 	return &ch, nil
+}
+
+// Me returns the user the current token belongs to.
+func (c *Client) Me(ctx context.Context) (*User, error) {
+	var u User
+	if err := c.do(ctx, http.MethodGet, "/api/v4/users/me", nil, &u); err != nil {
+		return nil, err
+	}
+	return &u, nil
 }
 
 // UsersByIDs resolves usernames for a set of user IDs.

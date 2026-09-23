@@ -42,6 +42,20 @@ printf '%s' "$PASSWORD" | mmcli login \
 Источник пароля при login (по приоритету): `--password` → `--password-stdin`
 → `$MMCLI_PASSWORD` → строка из stdin.
 
+### Bot account
+
+Бот не может войти по паролю — только по personal access token. Токен
+проверяется при login (`/users/me`), хранится в keyring; перелогина нет,
+отозванный или истёкший токен — ошибка.
+
+```sh
+printf '%s' "$BOT_TOKEN" | mmcli login \
+  --context bot \
+  --url https://mm.example.com \
+  --team myteam \
+  --token-stdin
+```
+
 ## Контексты
 
 Несколько серверов хранятся как именованные контексты в

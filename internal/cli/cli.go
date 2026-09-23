@@ -18,6 +18,7 @@ const usage = `mmcli — console Mattermost client
 
 Usage:
   mmcli login   --url URL --login-id ID [--context NAME] [--team TEAM] [--password-stdin]
+  mmcli login   --url URL --token-stdin [--context NAME] [--team TEAM]
   mmcli logout  [--context NAME]
   mmcli context list | use NAME | current
   mmcli get     <link|post_id> [--thread] [common]
@@ -44,6 +45,8 @@ Notes:
 login password sources (first non-empty wins):
   --password VALUE (insecure; visible in ps), --password-stdin (first stdin line),
   $MMCLI_PASSWORD, then a line read from stdin.
+  Bot accounts cannot log in with a password: use --token-stdin with a personal
+  access token. A token context never re-logs-in; a rejected token is an error.
 
 Output (for an automated consumer):
   Default is compact JSON to stdout; errors go to stderr with a non-zero exit.
@@ -54,6 +57,8 @@ Output (for an automated consumer):
 Examples:
   echo "$PW" | mmcli login --context work --url https://mm.example.com \
       --login-id me@example.com --team myteam --password-stdin
+  echo "$BOT_TOKEN" | mmcli login --context bot --url https://mm.example.com \
+      --team myteam --token-stdin
   mmcli get https://mm.example.com/myteam/pl/<id> --thread --pretty
   mmcli search "@me" --after 2026-06-01 --limit 20      # posts mentioning me
   mmcli search deploy --channel ops --from alice --before 2026-06-15
@@ -160,6 +165,14 @@ func (d deps) buildClient(name string) (*mm.Client, string, config.Context, erro
 		if err != nil {
 			return nil, "", config.Context{}, err
 		}
+	}
+
+	if cc.Auth == config.AuthToken {
+		token, err := d.store.Get(secrets.TokenKey(ctxName))
+		if err != nil {
+			return nil, "", config.Context{}, fmt.Errorf("read access token for context %q: %w", ctxName, err)
+		}
+		return mm.New(cc.URL, token, "", ""), ctxName, cc, nil
 	}
 
 	password, err := d.store.Get(secrets.PasswordKey(ctxName))

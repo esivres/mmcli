@@ -14,7 +14,8 @@ import (
 	"github.com/esivres/mmcli/internal/secrets"
 )
 
-// cmdLogin stores a context, persists the password in the keyring, and logs in.
+// cmdLogin stores a context, persists the password (or access token) in the
+// keyring, and logs in.
 func cmdLogin(d deps, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
@@ -24,9 +25,16 @@ func cmdLogin(d deps, args []string) error {
 	team := fs.String("team", "", "default team URL name")
 	password := fs.String("password", "", "password (insecure; prefer --password-stdin)")
 	passwordStdin := fs.Bool("password-stdin", false, "read password from the first line of stdin")
+	tokenStdin := fs.Bool("token-stdin", false, "read a personal access token from the first line of stdin (bot accounts)")
 	pretty := fs.Bool("pretty", false, "indented JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *tokenStdin {
+		if *password != "" || *passwordStdin || *loginID != "" {
+			return fmt.Errorf("--token-stdin cannot be combined with --login-id or password flags")
+		}
+		return loginWithToken(d, *name, *url, *team, *pretty)
 	}
 	if *url == "" || *loginID == "" {
 		return fmt.Errorf("--url and --login-id are required")
@@ -73,6 +81,57 @@ func cmdLogin(d deps, args []string) error {
 		"url":     *url,
 		"login":   *loginID,
 	}, *pretty)
+}
+
+// loginWithToken validates a personal access token and stores a token context.
+func loginWithToken(d deps, name, url, team string, pretty bool) error {
+	if url == "" {
+		return fmt.Errorf("--url is required")
+	}
+	sc := bufio.NewScanner(d.stdin)
+	if !sc.Scan() {
+		return fmt.Errorf("no token on stdin")
+	}
+	tok := strings.TrimSpace(sc.Text())
+	if tok == "" {
+		return fmt.Errorf("empty token")
+	}
+
+	ctx, cancel := newCtx()
+	defer cancel()
+	me, err := mm.New(url, tok, "", "").Me(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := d.store.Set(secrets.TokenKey(name), tok); err != nil {
+		return fmt.Errorf("store token: %w", err)
+	}
+	// A leftover password would never be used again for this context.
+	if err := d.store.Delete(secrets.PasswordKey(name)); err != nil {
+		return err
+	}
+
+	path, err := config.DefaultPath()
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	cfg.Set(name, config.Context{URL: strings.TrimRight(url, "/"), LoginID: me.Username, DefaultTeam: team, Auth: config.AuthToken})
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+
+	return output.Emit(d.stdout, map[string]any{
+		"status":  "ok",
+		"context": name,
+		"url":     url,
+		"login":   me.Username,
+		"auth":    config.AuthToken,
+	}, pretty)
 }
 
 // readPassword resolves the password from (in order): flag, stdin, env.
@@ -151,11 +210,12 @@ func cmdContext(d deps, args []string) error {
 			URL     string `json:"url"`
 			Login   string `json:"login"`
 			Team    string `json:"team,omitempty"`
+			Auth    string `json:"auth,omitempty"`
 			Current bool   `json:"current"`
 		}
 		var rows []row
 		for n, c := range cfg.Contexts {
-			rows = append(rows, row{Name: n, URL: c.URL, Login: c.LoginID, Team: c.DefaultTeam, Current: n == cfg.CurrentName})
+			rows = append(rows, row{Name: n, URL: c.URL, Login: c.LoginID, Team: c.DefaultTeam, Auth: c.Auth, Current: n == cfg.CurrentName})
 		}
 		return output.Emit(d.stdout, rows, true)
 	case "current":

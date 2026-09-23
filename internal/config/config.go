@@ -19,7 +19,13 @@ type Context struct {
 	URL         string `json:"url"`
 	LoginID     string `json:"login_id"`
 	DefaultTeam string `json:"default_team,omitempty"`
+	// Auth is AuthToken for personal access token contexts (bot accounts
+	// cannot log in with a password); empty means login_id/password.
+	Auth string `json:"auth,omitempty"`
 }
+
+// AuthToken marks a context authenticated by a personal access token.
+const AuthToken = "token"
 
 // Config is the on-disk document. The file path is kept separately and is not
 // serialized.
