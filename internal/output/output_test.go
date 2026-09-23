@@ -16,7 +16,7 @@ func TestPostsChronological(t *testing.T) {
 			"p2": {ID: "p2", CreateAt: 2000, UserID: "u2", Message: "second"},
 		},
 	}
-	names := map[string]string{"u1": "alice", "u2": "bob"}
+	names := Names{Users: map[string]string{"u1": "alice", "u2": "bob"}}
 	got := Posts(pl, names)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 posts, got %d", len(got))
@@ -32,7 +32,7 @@ func TestPostsChronological(t *testing.T) {
 // render must fall back to the raw user ID when no username is known.
 func TestRenderUnknownUser(t *testing.T) {
 	p := &mm.Post{ID: "x", UserID: "u9", Message: "hi"}
-	r := One(p, map[string]string{})
+	r := One(p, Names{})
 	if r.User != "u9" {
 		t.Fatalf("expected fallback to raw id u9, got %q", r.User)
 	}

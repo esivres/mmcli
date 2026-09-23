@@ -14,21 +14,28 @@ import (
 )
 
 // RenderedPost is the flattened, enriched shape we emit for posts: human time
-// and resolved username instead of raw epoch/IDs.
+// and resolved username/channel instead of raw epoch/IDs.
 type RenderedPost struct {
 	ID        string `json:"id"`
 	Time      string `json:"time"`
 	User      string `json:"user"`
 	ChannelID string `json:"channel_id"`
+	Channel   string `json:"channel,omitempty"`
 	RootID    string `json:"root_id,omitempty"`
 	Message   string `json:"message"`
 }
 
+// Names maps user IDs to usernames and channel IDs to readable labels.
+type Names struct {
+	Users    map[string]string
+	Channels map[string]string
+}
+
 // Posts flattens a PostList into chronological RenderedPosts (oldest first),
-// resolving user IDs via the supplied username map. Mattermost's PostList.Order
+// resolving IDs via names. Mattermost's PostList.Order
 // is not reliably time-sorted (notably the thread endpoint), so we sort by
 // CreateAt explicitly.
-func Posts(pl *mm.PostList, usernames map[string]string) []RenderedPost {
+func Posts(pl *mm.PostList, names Names) []RenderedPost {
 	if pl == nil {
 		return nil
 	}
@@ -41,18 +48,18 @@ func Posts(pl *mm.PostList, usernames map[string]string) []RenderedPost {
 	sort.Slice(posts, func(i, j int) bool { return posts[i].CreateAt < posts[j].CreateAt })
 	out := make([]RenderedPost, 0, len(posts))
 	for _, p := range posts {
-		out = append(out, render(p, usernames))
+		out = append(out, render(p, names))
 	}
 	return out
 }
 
 // One renders a single post.
-func One(p *mm.Post, usernames map[string]string) RenderedPost {
-	return render(p, usernames)
+func One(p *mm.Post, names Names) RenderedPost {
+	return render(p, names)
 }
 
-func render(p *mm.Post, usernames map[string]string) RenderedPost {
-	user := usernames[p.UserID]
+func render(p *mm.Post, names Names) RenderedPost {
+	user := names.Users[p.UserID]
 	if user == "" {
 		user = p.UserID
 	}
@@ -61,6 +68,7 @@ func render(p *mm.Post, usernames map[string]string) RenderedPost {
 		Time:      time.UnixMilli(p.CreateAt).Format(time.RFC3339),
 		User:      user,
 		ChannelID: p.ChannelID,
+		Channel:   names.Channels[p.ChannelID],
 		RootID:    p.RootID,
 		Message:   p.Message,
 	}

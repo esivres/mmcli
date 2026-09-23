@@ -217,6 +217,15 @@ func (c *Client) GetTeamByName(ctx context.Context, name string) (*Team, error) 
 	return &t, nil
 }
 
+// GetChannel fetches a channel by ID.
+func (c *Client) GetChannel(ctx context.Context, id string) (*Channel, error) {
+	var ch Channel
+	if err := c.do(ctx, http.MethodGet, "/api/v4/channels/"+id, nil, &ch); err != nil {
+		return nil, err
+	}
+	return &ch, nil
+}
+
 // GetChannelByName resolves a channel by name within a team.
 func (c *Client) GetChannelByName(ctx context.Context, teamID, name string) (*Channel, error) {
 	var ch Channel

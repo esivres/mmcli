@@ -288,15 +288,13 @@ func cmdGet(d deps, args []string, thread bool) error {
 		if err != nil {
 			return err
 		}
-		names := usernamesFor(ctx, client, pl)
-		return output.Emit(d.stdout, output.Posts(pl, names), c.pretty)
+		return output.Emit(d.stdout, output.Posts(pl, namesFor(ctx, client, postsOf(pl)...)), c.pretty)
 	}
 	p, err := client.GetPost(ctx, ref.PostID)
 	if err != nil {
 		return err
 	}
-	names := resolveUsernames(ctx, client, []string{p.UserID})
-	return output.Emit(d.stdout, output.One(p, names), c.pretty)
+	return output.Emit(d.stdout, output.One(p, namesFor(ctx, client, p)), c.pretty)
 }
 
 // cmdSearch searches posts within a team, assembling Mattermost search
@@ -337,8 +335,7 @@ func cmdSearch(d deps, args []string) error {
 	if err != nil {
 		return err
 	}
-	names := usernamesFor(ctx, client, pl)
-	return output.Emit(d.stdout, output.Posts(pl, names), c.pretty)
+	return output.Emit(d.stdout, output.Posts(pl, namesFor(ctx, client, postsOf(pl)...)), c.pretty)
 }
 
 // buildTerms assembles a Mattermost search string from a free query plus
@@ -405,8 +402,7 @@ func cmdReply(d deps, args []string) error {
 	if err != nil {
 		return err
 	}
-	names := resolveUsernames(ctx, client, []string{created.UserID})
-	return output.Emit(d.stdout, output.One(created, names), c.pretty)
+	return output.Emit(d.stdout, output.One(created, namesFor(ctx, client, created)), c.pretty)
 }
 
 // cmdDelete deletes a post by link or ID.
@@ -482,8 +478,7 @@ func cmdPost(d deps, args []string) error {
 	if err != nil {
 		return err
 	}
-	names := resolveUsernames(ctx, client, []string{created.UserID})
-	return output.Emit(d.stdout, output.One(created, names), c.pretty)
+	return output.Emit(d.stdout, output.One(created, namesFor(ctx, client, created)), c.pretty)
 }
 
 // directChannelID returns the direct channel between the caller and username,

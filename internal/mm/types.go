@@ -31,6 +31,8 @@ type Channel struct {
 	TeamID      string `json:"team_id"`
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
+	// Type is O (public), P (private), D (direct) or G (group message).
+	Type string `json:"type"`
 }
 
 // User is a Mattermost user (subset).

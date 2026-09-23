@@ -11,6 +11,7 @@ import (
 
 	"github.com/esivres/mmcli/internal/config"
 	"github.com/esivres/mmcli/internal/mm"
+	"github.com/esivres/mmcli/internal/output"
 	"github.com/esivres/mmcli/internal/secrets"
 )
 
@@ -54,7 +55,8 @@ Output (for an automated consumer):
   Default is compact JSON to stdout; errors go to stderr with a non-zero exit.
   get returns one object; thread/search return a JSON array sorted oldest-first.
   Each post object: {"id","time" (RFC3339),"user" (username),"channel_id",
-  "root_id" (omitted if none),"message"}.
+  "channel" (name, "@user" for a direct message, title for a group message;
+  omitted if unresolved),"root_id" (omitted if none),"message"}.
 
 Examples:
   echo "$PW" | mmcli login --context work --url https://mm.example.com \
@@ -211,32 +213,85 @@ func resolveTeamID(ctx context.Context, client *mm.Client, cc config.Context, ex
 	return t.ID, nil
 }
 
-// usernamesFor resolves usernames for all authors in a PostList.
-func usernamesFor(ctx context.Context, client *mm.Client, pl *mm.PostList) map[string]string {
+// namesFor resolves authors and channels of posts. It is best-effort: on
+// errors the renderer falls back to raw IDs.
+func namesFor(ctx context.Context, client *mm.Client, posts ...*mm.Post) output.Names {
+	names := output.Names{Users: map[string]string{}, Channels: map[string]string{}}
+	userIDs := map[string]struct{}{}
+	channels := map[string]*mm.Channel{}
+	for _, p := range posts {
+		userIDs[p.UserID] = struct{}{}
+		if _, ok := channels[p.ChannelID]; ok {
+			continue
+		}
+		ch, err := client.GetChannel(ctx, p.ChannelID)
+		if err != nil {
+			continue
+		}
+		channels[p.ChannelID] = ch
+		if ch.Type == "D" {
+			// Direct channel names are "<userID>__<userID>".
+			for _, id := range strings.Split(ch.Name, "__") {
+				userIDs[id] = struct{}{}
+			}
+		}
+	}
+
+	ids := make([]string, 0, len(userIDs))
+	for id := range userIDs {
+		ids = append(ids, id)
+	}
+	if users, err := client.UsersByIDs(ctx, ids); err == nil {
+		for _, u := range users {
+			names.Users[u.ID] = u.Username
+		}
+	}
+
+	var meID string
+	for id, ch := range channels {
+		switch ch.Type {
+		case "D":
+			if meID == "" {
+				if me, err := client.Me(ctx); err == nil {
+					meID = me.ID
+				}
+			}
+			names.Channels[id] = directLabel(ch.Name, meID, names.Users)
+		case "G":
+			names.Channels[id] = ch.DisplayName
+		default:
+			names.Channels[id] = ch.Name
+		}
+	}
+	return names
+}
+
+// directLabel renders a direct channel as "@<the other user>".
+func directLabel(channelName, meID string, users map[string]string) string {
+	a, b, ok := strings.Cut(channelName, "__")
+	if !ok {
+		return channelName
+	}
+	other := a
+	if a == meID {
+		other = b
+	}
+	if u := users[other]; u != "" {
+		return "@" + u
+	}
+	return channelName
+}
+
+// postsOf returns the posts of a PostList in no particular order.
+func postsOf(pl *mm.PostList) []*mm.Post {
 	if pl == nil {
 		return nil
 	}
-	seen := map[string]struct{}{}
-	var ids []string
+	out := make([]*mm.Post, 0, len(pl.Posts))
 	for _, p := range pl.Posts {
-		if _, ok := seen[p.UserID]; !ok {
-			seen[p.UserID] = struct{}{}
-			ids = append(ids, p.UserID)
-		}
+		out = append(out, p)
 	}
-	return resolveUsernames(ctx, client, ids)
-}
-
-func resolveUsernames(ctx context.Context, client *mm.Client, ids []string) map[string]string {
-	m := map[string]string{}
-	users, err := client.UsersByIDs(ctx, ids)
-	if err != nil {
-		return m // best-effort; renderer falls back to raw IDs
-	}
-	for _, u := range users {
-		m[u.ID] = u.Username
-	}
-	return m
+	return out
 }
 
 func joinMessage(args []string) string {
