@@ -361,44 +361,67 @@ func cmdSearch(d deps, args []string) error {
 // ignores per_page above it and returns nothing for further pages.
 const searchCap = 100
 
-// searchAll works around searchCap by re-querying with before: set just past
-// the oldest result's UTC day, deduplicating the overlap. terms builds the
-// query for a given before: bound. It stops at maxPosts (0 = no cap) and
-// returns a warning when results were cut off.
+// searchAll runs a post search past searchCap; see walkBack.
 func searchAll(ctx context.Context, client *mm.Client, teamID string, terms func(before string) string, before string, orSearch bool, maxPosts int) (*mm.PostList, string, error) {
-	merged := &mm.PostList{Posts: map[string]*mm.Post{}}
-	for {
-		// Offset 0 pins day boundaries to UTC, matching the day arithmetic below.
+	posts, warning, err := walkBack(before, maxPosts, func(before string) ([]*mm.Post, error) {
+		// Offset 0 pins day boundaries to UTC, matching walkBack's day arithmetic.
 		pl, err := client.Search(ctx, teamID, mm.SearchOpts{Terms: terms(before), IsOrSearch: orSearch, PerPage: searchCap, TimeZoneOffset: 0})
+		if err != nil {
+			return nil, err
+		}
+		var page []*mm.Post
+		for _, id := range pl.Order {
+			if p := pl.Posts[id]; p != nil {
+				page = append(page, p)
+			}
+		}
+		return page, nil
+	}, func(p *mm.Post) (string, int64) { return p.ID, p.CreateAt })
+	if err != nil {
+		return nil, "", err
+	}
+	merged := &mm.PostList{Posts: map[string]*mm.Post{}}
+	for _, p := range posts {
+		merged.Order = append(merged.Order, p.ID)
+		merged.Posts[p.ID] = p
+	}
+	return merged, warning, nil
+}
+
+// walkBack works around searchCap by re-querying with before: set just past
+// the oldest result's UTC day, deduplicating the overlap. It stops at
+// maxItems (0 = no cap) and returns a warning when results were cut off.
+func walkBack[T any](before string, maxItems int, fetch func(before string) ([]T, error), key func(T) (string, int64)) ([]T, string, error) {
+	var out []T
+	seen := map[string]bool{}
+	for {
+		page, err := fetch(before)
 		if err != nil {
 			return nil, "", err
 		}
 		var oldest int64
-		for _, id := range pl.Order {
-			p := pl.Posts[id]
-			if p == nil {
+		for _, item := range page {
+			id, at := key(item)
+			if oldest == 0 || at < oldest {
+				oldest = at
+			}
+			if seen[id] {
 				continue
 			}
-			if oldest == 0 || p.CreateAt < oldest {
-				oldest = p.CreateAt
+			if maxItems > 0 && len(out) == maxItems {
+				return out, fmt.Sprintf("stopped at --limit %d, more results exist (raise --limit or use --all)", maxItems), nil
 			}
-			if _, dup := merged.Posts[id]; dup {
-				continue
-			}
-			if maxPosts > 0 && len(merged.Order) == maxPosts {
-				return merged, fmt.Sprintf("stopped at --limit %d, more results exist (raise --limit or use --all)", maxPosts), nil
-			}
-			merged.Order = append(merged.Order, id)
-			merged.Posts[id] = p
+			seen[id] = true
+			out = append(out, item)
 		}
-		if len(pl.Order) < searchCap {
-			return merged, "", nil
+		if len(page) < searchCap {
+			return out, "", nil
 		}
 		oldestDay := time.UnixMilli(oldest).UTC().Truncate(24 * time.Hour)
 		next := oldestDay.Add(24 * time.Hour).Format("2006-01-02")
 		// The bound must strictly move back in time, or the walk cannot finish.
 		if before != "" && next >= before {
-			return merged, fmt.Sprintf("more than %d results on %s (UTC), results from that day and earlier skipped (narrow the query)", searchCap, oldestDay.Format("2006-01-02")), nil
+			return out, fmt.Sprintf("more than %d results on %s (UTC), results from that day and earlier skipped (narrow the query)", searchCap, oldestDay.Format("2006-01-02")), nil
 		}
 		before = next
 	}

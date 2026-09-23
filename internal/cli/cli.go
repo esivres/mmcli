@@ -29,6 +29,9 @@ Usage:
   mmcli post    <channel|~channel|@user|link> <message...> [--team T] [common]
   mmcli delete  <link|post_id> [common]
   mmcli stream  [--context NAME]... [--mention] [--dm] [--channel NAME]... [--merge-window 1.5s]
+  mmcli file search <query...> [--ext EXT] [--channel C] [--from USER] [--after D] [--before D] [--limit N | --all] [common]
+  mmcli file get  <file_id> [--out DIR] [common]
+  mmcli file text <file_id> [--max-chars N] [--out DIR] [common]
   mmcli version
 
 Common flags (get/thread/search/reply/post):
@@ -65,6 +68,11 @@ login password sources (first non-empty wins):
   Mattermost is final: on the first attempt stream exits with an error;
   later it prints {"event":"failed",...} and exits non-zero once no context
   is left.
+  Posts list attachments in "files" ({"id","name","mime","size"}). file get
+  saves to the user cache dir (or --out) and prints the path. file text also
+  extracts text: plain text/logs, docx, xlsx, pdf (needs pdftotext), zip
+  (entries, with size/count/depth limits; skipped entries are listed). Long
+  text keeps its start and end. Images are refused: no OCR, view the file.
   login makes the context current only if none is current yet, or with --use.
   Bot accounts cannot log in with a password: use --token-stdin with a personal
   access token. A token context never re-logs-in; a rejected token is an error.
@@ -133,6 +141,8 @@ func run(d deps, args []string) int {
 		err = cmdDelete(d, args[1:])
 	case "stream":
 		err = cmdStream(d, args[1:])
+	case "file":
+		err = cmdFile(d, args[1:])
 	case "version", "--version":
 		fmt.Fprintln(d.stdout, Version)
 		return 0

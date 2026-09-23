@@ -9,6 +9,28 @@ type Post struct {
 	ChannelID string `json:"channel_id"`
 	RootID    string `json:"root_id"`
 	Message   string `json:"message"`
+	Metadata  struct {
+		Files []FileInfo `json:"files"`
+	} `json:"metadata"`
+}
+
+// FileInfo describes an attachment (subset).
+type FileInfo struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Extension string `json:"extension"`
+	Size      int64  `json:"size"`
+	MimeType  string `json:"mime_type"`
+	PostID    string `json:"post_id"`
+	ChannelID string `json:"channel_id"`
+	UserID    string `json:"user_id"`
+	CreateAt  int64  `json:"create_at"`
+}
+
+// FileInfoList is a file search result. Order is newest-first.
+type FileInfoList struct {
+	Order     []string             `json:"order"`
+	FileInfos map[string]*FileInfo `json:"file_infos"`
 }
 
 // PostList is Mattermost's ordered post collection (threads, search results).

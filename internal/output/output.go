@@ -16,13 +16,22 @@ import (
 // RenderedPost is the flattened, enriched shape we emit for posts: human time
 // and resolved username/channel instead of raw epoch/IDs.
 type RenderedPost struct {
-	ID        string `json:"id"`
-	Time      string `json:"time"`
-	User      string `json:"user"`
-	ChannelID string `json:"channel_id"`
-	Channel   string `json:"channel,omitempty"`
-	RootID    string `json:"root_id,omitempty"`
-	Message   string `json:"message"`
+	ID        string         `json:"id"`
+	Time      string         `json:"time"`
+	User      string         `json:"user"`
+	ChannelID string         `json:"channel_id"`
+	Channel   string         `json:"channel,omitempty"`
+	RootID    string         `json:"root_id,omitempty"`
+	Message   string         `json:"message"`
+	Files     []RenderedFile `json:"files,omitempty"`
+}
+
+// RenderedFile is an attachment as emitted with a post.
+type RenderedFile struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Mime string `json:"mime,omitempty"`
+	Size int64  `json:"size"`
 }
 
 // Names maps user IDs to usernames and channel IDs to readable labels.
@@ -62,6 +71,10 @@ func render(p *mm.Post, names Names) RenderedPost {
 	if user == "" {
 		user = p.UserID
 	}
+	var files []RenderedFile
+	for _, f := range p.Metadata.Files {
+		files = append(files, RenderedFile{ID: f.ID, Name: f.Name, Mime: f.MimeType, Size: f.Size})
+	}
 	return RenderedPost{
 		ID:        p.ID,
 		Time:      time.UnixMilli(p.CreateAt).Format(time.RFC3339),
@@ -70,6 +83,7 @@ func render(p *mm.Post, names Names) RenderedPost {
 		Channel:   names.Channels[p.ChannelID],
 		RootID:    p.RootID,
 		Message:   p.Message,
+		Files:     files,
 	}
 }
 

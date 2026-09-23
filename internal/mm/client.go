@@ -218,6 +218,57 @@ func (c *Client) DeletePost(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/api/v4/posts/"+id, nil, nil)
 }
 
+// SearchFiles runs a file search (names and extracted content) within a team.
+func (c *Client) SearchFiles(ctx context.Context, teamID string, opts SearchOpts) (*FileInfoList, error) {
+	var fl FileInfoList
+	if err := c.do(ctx, http.MethodPost, "/api/v4/teams/"+teamID+"/files/search", opts, &fl); err != nil {
+		return nil, err
+	}
+	return &fl, nil
+}
+
+// GetFileInfo fetches attachment metadata.
+func (c *Client) GetFileInfo(ctx context.Context, id string) (*FileInfo, error) {
+	var fi FileInfo
+	if err := c.do(ctx, http.MethodGet, "/api/v4/files/"+id+"/info", nil, &fi); err != nil {
+		return nil, err
+	}
+	return &fi, nil
+}
+
+// DownloadFile copies an attachment's content to w, re-logging-in once on a
+// 401 like other requests.
+func (c *Client) DownloadFile(ctx context.Context, id string, w io.Writer) error {
+	for retry := true; ; retry = false {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v4/files/"+id, nil)
+		if err != nil {
+			return err
+		}
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return fmt.Errorf("download file %s: %w", id, err)
+		}
+		if resp.StatusCode == http.StatusUnauthorized && retry && c.loginID != "" {
+			resp.Body.Close()
+			if err := c.Login(ctx); err != nil {
+				return fmt.Errorf("re-login after 401: %w", err)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return decodeAPIError(resp)
+		}
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			return fmt.Errorf("download file %s: %w", id, err)
+		}
+		return nil
+	}
+}
+
 // GetTeamByName resolves a team by its URL name.
 func (c *Client) GetTeamByName(ctx context.Context, name string) (*Team, error) {
 	var t Team
