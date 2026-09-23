@@ -19,6 +19,7 @@ type sink struct {
 	tailStart  int
 	total      int64
 	stopAt     int64 // total bytes after which writes fail
+	stopped    bool
 	onStop     func()
 }
 
@@ -33,6 +34,7 @@ func (s *sink) Write(p []byte) (int, error) {
 	}
 	s.add(p[:n])
 	if n < len(p) {
+		s.stopped = true
 		if s.onStop != nil {
 			s.onStop()
 		}
@@ -71,7 +73,7 @@ func (s *sink) add(p []byte) {
 	}
 }
 
-func (s *sink) failed() bool { return s.stopAt > 0 && s.total >= s.stopAt }
+func (s *sink) failed() bool { return s.stopped }
 
 // result assembles the kept text; cut runes at the seams are dropped.
 func (s *sink) result(stopped bool) Result {
@@ -80,8 +82,9 @@ func (s *sink) result(stopped bool) Result {
 	if s.total <= kept && !stopped {
 		return Result{Text: toValid(append(s.head, tail...))}
 	}
+	// Only a rune cut at the seam is dropped; other invalid bytes become U+FFFD.
 	head := s.head
-	for len(head) > 0 && !utf8.Valid(head) {
+	for i := 0; i < 3 && len(head) > 0 && !utf8.FullRune(head[lastRuneStart(head):]); i++ {
 		head = head[:len(head)-1]
 	}
 	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
@@ -93,6 +96,15 @@ func (s *sink) result(stopped bool) Result {
 		marker = fmt.Sprintf("\n[... %d bytes omitted; extraction stopped at the %d-byte output limit ...]\n", omitted, s.stopAt)
 	}
 	return Result{Text: toValid(head) + marker + toValid(tail), Truncated: true, Omitted: omitted}
+}
+
+func lastRuneStart(b []byte) int {
+	for i := len(b) - 1; i >= 0 && i >= len(b)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(b[i]) {
+			return i
+		}
+	}
+	return max(len(b)-1, 0)
 }
 
 func toValid(b []byte) string { return string([]rune(string(b))) }

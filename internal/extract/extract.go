@@ -376,11 +376,16 @@ func (x *extractor) sheetRows(raw []byte, shared []string) error {
 		} else {
 			prev++
 		}
+		// Cells share the strings they reference; the row is streamed to the
+		// sink so one big shared string repeated per cell is never joined.
 		var cells []string
 		for _, c := range row.Cells {
 			col, ok := colIndex(c.Ref)
 			if !ok {
 				col = len(cells) // a missing or broken reference follows the previous cell
+			}
+			if col >= maxColumns {
+				continue
 			}
 			for col >= len(cells) {
 				cells = append(cells, "")
@@ -396,7 +401,17 @@ func (x *extractor) sheetRows(raw []byte, shared []string) error {
 			}
 			cells[col] = strings.ReplaceAll(v, "\t", " ")
 		}
-		if _, err := x.out.Write([]byte(strings.Join(cells, "\t") + "\n")); err != nil {
+		for i, v := range cells {
+			if i > 0 {
+				if err := x.out.WriteByte('\t'); err != nil {
+					return err
+				}
+			}
+			if _, err := io.WriteString(x.out, v); err != nil {
+				return err
+			}
+		}
+		if err := x.out.WriteByte('\n'); err != nil {
 			return err
 		}
 	}

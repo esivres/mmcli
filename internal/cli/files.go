@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -235,13 +236,36 @@ func download(ctx context.Context, client *mm.Client, id, dest string, replace b
 	if replace {
 		return os.Rename(tmp.Name(), dest)
 	}
-	if err := os.Link(tmp.Name(), dest); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("%s already exists; not replacing it", dest)
-		}
-		return err
+	err = os.Link(tmp.Name(), dest)
+	if errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("%s already exists; not replacing it", dest)
+	}
+	if err != nil {
+		// Some filesystems (FAT, many network mounts) have no hard links.
+		return copyExclusive(tmp.Name(), dest)
 	}
 	return nil
+}
+
+func copyExclusive(src, dest string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("%s already exists; not replacing it", dest)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dest)
+		return err
+	}
+	return out.Close()
 }
 
 // safeFileName keeps only the base name so a crafted name cannot escape dir.
